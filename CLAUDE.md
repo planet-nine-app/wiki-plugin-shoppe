@@ -80,6 +80,54 @@ my-shoppe.zip
 }
 ```
 
+### books/*/info.json
+
+```json
+{
+  "title": "My Novel",
+  "description": "A gripping tale",
+  "price": 9,
+  "cover": "front.jpg"
+}
+```
+
+`cover` pins a specific image file as the Sanora cover image. If omitted, the first image in the folder is used.
+
+### music/*/info.json (albums)
+
+```json
+{
+  "title": "My Album",
+  "description": "Debut record",
+  "price": 10,
+  "cover": "artwork.jpg"
+}
+```
+
+### music/*.json (standalone track sidecar)
+
+A `.json` file with the same basename as the audio file:
+
+```
+music/
+  my-track.mp3
+  my-track.json    ← { "title": "…", "description": "…", "price": 0 }
+```
+
+### posts/*/index.md front matter
+
+Posts support TOML (`+++ … +++`) or YAML (`--- … ---`) front matter:
+
+```toml
++++
+title = "On boiling the ocean"
+date = "2025-01-12"
+preview = "ocean.jpg"
++++
+```
+
+`preview` pins a specific image as the post cover. If omitted, the first image in the folder is used. `title` and `date` override folder name and `info.json`.
+
 ### products/*/info.json
 
 ```json
@@ -87,7 +135,8 @@ my-shoppe.zip
   "title": "Planet Nine T-Shirt",
   "description": "Comfortable cotton tee with logo",
   "price": 25,
-  "shipping": 5
+  "shipping": 5,
+  "cover": "front.jpg"
 }
 ```
 

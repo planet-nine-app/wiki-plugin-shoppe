@@ -246,8 +246,11 @@
         r.products.length && `📦 ${r.products.length} product${r.products.length !== 1 ? 's' : ''}`
       ].filter(Boolean).join(' · ') || 'no items found';
 
+      const warnings = (r.warnings && r.warnings.length > 0)
+        ? `<br><br>⚠️ <strong>Warnings (${r.warnings.length}):</strong><br>${r.warnings.map(w => `• ${w}`).join('<br>')}`
+        : '';
       showStatus(container, '#sw-upload-status',
-        `✅ <strong>${result.tenant.name}</strong> ${result.tenant.emojicode} updated — ${counts}<br>
+        `✅ <strong>${result.tenant.name}</strong> ${result.tenant.emojicode} updated — ${counts}${warnings}<br>
          <a href="/plugin/shoppe/${result.tenant.uuid}" target="_blank" class="sw-link" style="display:inline-block;margin-top:8px;">View your shoppe →</a>`,
         'success');
       loadDirectory(container);

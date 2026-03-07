@@ -9,9 +9,10 @@ const sessionless = require('sessionless-node');
 
 const SHOPPE_BASE_EMOJI = process.env.SHOPPE_BASE_EMOJI || '🛍️🎨🎁';
 
-const TENANTS_FILE = path.join(__dirname, '../.shoppe-tenants.json');
-const CONFIG_FILE  = path.join(__dirname, '../.shoppe-config.json');
-const TMP_DIR = '/tmp/shoppe-uploads';
+const DATA_DIR     = path.join(process.env.HOME || '/root', '.shoppe');
+const TENANTS_FILE = path.join(DATA_DIR, 'tenants.json');
+const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
+const TMP_DIR      = '/tmp/shoppe-uploads';
 
 // ============================================================
 // CONFIG (allyabase URL, etc.)
@@ -49,6 +50,64 @@ const EMOJI_PALETTE = [
 const BOOK_EXTS  = new Set(['.epub', '.pdf', '.mobi', '.azw', '.azw3']);
 const MUSIC_EXTS = new Set(['.mp3', '.flac', '.m4a', '.ogg', '.wav']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']);
+
+// ============================================================
+// MARKDOWN / FRONT MATTER UTILITIES
+// ============================================================
+
+// Parse +++ TOML or --- YAML front matter from a markdown string.
+// Returns { title, date, preview, body } — body is the content after the block.
+function parseFrontMatter(content) {
+  const result = { title: null, date: null, preview: null, body: content };
+  const m = content.match(/^(\+\+\+|---)\s*\n([\s\S]*?)\n\1\s*\n?([\s\S]*)/);
+  if (!m) return result;
+  const fm = m[2];
+  result.body = m[3] || '';
+  const grab = key => { const r = fm.match(new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, 'm')); return r ? r[1] : null; };
+  result.title   = grab('title');
+  result.date    = grab('date') || grab('updated');
+  result.preview = grab('preview');
+  return result;
+}
+
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderMarkdown(md) {
+  // Process code blocks first to avoid mangling their contents
+  const codeBlocks = [];
+  let out = md.replace(/```[\s\S]*?```/g, m => {
+    const lang = m.match(/^```(\w*)/)?.[1] || '';
+    const code = m.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '');
+    codeBlocks.push(`<pre><code class="lang-${lang}">${escHtml(code)}</code></pre>`);
+    return `\x00CODE${codeBlocks.length - 1}\x00`;
+  });
+
+  out = out
+    .replace(/^#{4} (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^#{3} (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^#{2} (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/^---+$/gm, '<hr>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:8px;margin:1em 0">')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Paragraphs: split on blank lines, wrap non-block-level content
+  const blockRe = /^<(h[1-6]|hr|pre|ul|ol|li|blockquote)/;
+  out = out.split(/\n{2,}/).map(chunk => {
+    chunk = chunk.trim();
+    if (!chunk || blockRe.test(chunk) || chunk.startsWith('\x00CODE')) return chunk;
+    return '<p>' + chunk.replace(/\n/g, '<br>') + '</p>';
+  }).join('\n');
+
+  // Restore code blocks
+  codeBlocks.forEach((block, i) => { out = out.replace(`\x00CODE${i}\x00`, block); });
+  return out;
+}
 
 // ============================================================
 // TENANT MANAGEMENT
@@ -246,11 +305,27 @@ async function processArchive(zipPath) {
   zip.extractAllTo(tmpDir, true);
 
   try {
-    // Read and validate manifest
-    const manifestPath = path.join(tmpDir, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) {
+    // Find manifest.json — handle zips wrapped in a top-level folder and
+    // macOS zips that include a __MACOSX metadata folder alongside the content.
+    function findManifest(dir, depth = 0) {
+      const direct = path.join(dir, 'manifest.json');
+      if (fs.existsSync(direct)) return dir;
+      if (depth >= 2) return null;
+      const entries = fs.readdirSync(dir).filter(f =>
+        f !== '__MACOSX' && fs.statSync(path.join(dir, f)).isDirectory()
+      );
+      for (const entry of entries) {
+        const found = findManifest(path.join(dir, entry), depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    const root = findManifest(tmpDir);
+    if (!root) {
       throw new Error('Archive is missing manifest.json');
     }
+    const manifestPath = path.join(root, 'manifest.json');
 
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     if (!manifest.uuid || !manifest.emojicode) {
@@ -263,31 +338,42 @@ async function processArchive(zipPath) {
       throw new Error('emojicode does not match registered tenant');
     }
 
-    const results = { books: [], music: [], posts: [], albums: [], products: [] };
+    const results = { books: [], music: [], posts: [], albums: [], products: [], warnings: [] };
+
+    function readInfo(entryPath) {
+      const infoPath = path.join(entryPath, 'info.json');
+      if (!fs.existsSync(infoPath)) return {};
+      try {
+        return JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+      } catch (err) {
+        const msg = `info.json in "${path.basename(entryPath)}" is invalid JSON: ${err.message}`;
+        results.warnings.push(msg);
+        console.warn(`[shoppe]   ⚠️  ${msg}`);
+        return {};
+      }
+    }
 
     // ---- books/ ----
     // Each book is a subfolder containing the book file, cover.jpg, and info.json
-    const booksDir = path.join(tmpDir, 'books');
+    const booksDir = path.join(root, 'books');
     if (fs.existsSync(booksDir)) {
       for (const entry of fs.readdirSync(booksDir)) {
         const entryPath = path.join(booksDir, entry);
         if (!fs.statSync(entryPath).isDirectory()) continue;
         try {
-          const infoPath = path.join(entryPath, 'info.json');
-          const info = fs.existsSync(infoPath)
-            ? JSON.parse(fs.readFileSync(infoPath, 'utf8'))
-            : {};
+          const info = readInfo(entryPath);
           const title = info.title || entry;
           const description = info.description || '';
           const price = info.price || 0;
 
           await sanoraCreateProduct(tenant, title, 'book', description, price, 0, 'book');
 
-          // Cover image
+          // Cover image — use info.cover to pin a specific file, else first image found
           const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
-          if (covers.length > 0) {
-            const coverBuf = fs.readFileSync(path.join(entryPath, covers[0]));
-            await sanoraUploadImage(tenant, title, coverBuf, covers[0]);
+          const coverFile = info.cover ? (covers.find(f => f === info.cover) || covers[0]) : covers[0];
+          if (coverFile) {
+            const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+            await sanoraUploadImage(tenant, title, coverBuf, coverFile);
           }
 
           // Book file
@@ -307,38 +393,51 @@ async function processArchive(zipPath) {
 
     // ---- music/ ----
     // Albums are subfolders; standalone files are individual tracks
-    const musicDir = path.join(tmpDir, 'music');
+    const musicDir = path.join(root, 'music');
     if (fs.existsSync(musicDir)) {
       for (const entry of fs.readdirSync(musicDir)) {
         const entryPath = path.join(musicDir, entry);
         const stat = fs.statSync(entryPath);
 
         if (stat.isDirectory()) {
-          // Album
-          const albumName = entry;
+          // Album — supports info.json: { title, description, price, cover }
+          const info = readInfo(entryPath);
+          const albumTitle = info.title || entry;
           const tracks = fs.readdirSync(entryPath).filter(f => MUSIC_EXTS.has(path.extname(f).toLowerCase()));
           const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
           try {
-            await sanoraCreateProduct(tenant, albumName, 'music', `Album: ${albumName}`, 0, 0, 'music,album');
-            if (covers.length > 0) {
-              const coverBuf = fs.readFileSync(path.join(entryPath, covers[0]));
-              await sanoraUploadImage(tenant, albumName, coverBuf, covers[0]);
+            const description = info.description || `Album: ${albumTitle}`;
+            const price = info.price || 0;
+            await sanoraCreateProduct(tenant, albumTitle, 'music', description, price, 0, 'music,album');
+            const coverFile = info.cover ? (covers.find(f => f === info.cover) || covers[0]) : covers[0];
+            if (coverFile) {
+              const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+              await sanoraUploadImage(tenant, albumTitle, coverBuf, coverFile);
             }
             for (const track of tracks) {
               const buf = fs.readFileSync(path.join(entryPath, track));
-              await sanoraUploadArtifact(tenant, albumName, buf, track, 'audio');
+              await sanoraUploadArtifact(tenant, albumTitle, buf, track, 'audio');
             }
-            results.music.push({ title: albumName, type: 'album', tracks: tracks.length });
-            console.log(`[shoppe]   🎵 album: ${albumName} (${tracks.length} tracks)`);
+            results.music.push({ title: albumTitle, type: 'album', tracks: tracks.length });
+            console.log(`[shoppe]   🎵 album: ${albumTitle} (${tracks.length} tracks)`);
           } catch (err) {
-            console.warn(`[shoppe]   ⚠️  album ${albumName}: ${err.message}`);
+            console.warn(`[shoppe]   ⚠️  album ${entry}: ${err.message}`);
           }
         } else if (MUSIC_EXTS.has(path.extname(entry).toLowerCase())) {
-          // Standalone track
-          const title = path.basename(entry, path.extname(entry));
+          // Standalone track — supports a sidecar .json with same basename: { title, description, price }
+          const baseName = path.basename(entry, path.extname(entry));
+          const sidecarPath = path.join(musicDir, baseName + '.json');
+          let trackInfo = {};
+          if (fs.existsSync(sidecarPath)) {
+            try { trackInfo = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')); }
+            catch (e) { results.warnings.push(`sidecar JSON for "${entry}" is invalid: ${e.message}`); }
+          }
+          const title = trackInfo.title || baseName;
           try {
             const buf = fs.readFileSync(entryPath);
-            await sanoraCreateProduct(tenant, title, 'music', `Track: ${title}`, 0, 0, 'music,track');
+            const description = trackInfo.description || `Track: ${title}`;
+            const price = trackInfo.price || 0;
+            await sanoraCreateProduct(tenant, title, 'music', description, price, 0, 'music,track');
             await sanoraUploadArtifact(tenant, title, buf, entry, 'audio');
             results.music.push({ title, type: 'track' });
             console.log(`[shoppe]   🎵 track: ${title}`);
@@ -353,7 +452,7 @@ async function processArchive(zipPath) {
     // Each post is a numbered subfolder: "01-My Title/" containing post.md,
     // optional assets (images etc.), and optional info.json for metadata overrides.
     // Folders are sorted by their numeric prefix to build the table of contents.
-    const postsDir = path.join(tmpDir, 'posts');
+    const postsDir = path.join(root, 'posts');
     if (fs.existsSync(postsDir)) {
       const postFolders = fs.readdirSync(postsDir)
         .filter(f => fs.statSync(path.join(postsDir, f)).isDirectory())
@@ -364,10 +463,7 @@ async function processArchive(zipPath) {
         const entryPath = path.join(postsDir, entry);
         const folderTitle = entry.replace(/^\d+-/, '');
 
-        const infoPath = path.join(entryPath, 'info.json');
-        const info = fs.existsSync(infoPath)
-          ? JSON.parse(fs.readFileSync(infoPath, 'utf8'))
-          : {};
+        const info = readInfo(entryPath);
         const seriesTitle = info.title || folderTitle;
 
         // Check if this is a multi-part series (has numbered subdirectories)
@@ -406,13 +502,7 @@ async function processArchive(zipPath) {
             const partPath = path.join(entryPath, partEntry);
             const partFolderTitle = partEntry.replace(/^\d+-/, '');
 
-            const partInfoPath = path.join(partPath, 'info.json');
-            const partInfo = fs.existsSync(partInfoPath)
-              ? JSON.parse(fs.readFileSync(partInfoPath, 'utf8'))
-              : {};
-            const partTitle = partInfo.title || partFolderTitle;
-            // Sanora product title must be unique — namespace under series
-            const productTitle = `${seriesTitle}: ${partTitle}`;
+            const partInfo = readInfo(partPath);
 
             try {
               const partMdFiles = fs.readdirSync(partPath).filter(f => f.endsWith('.md'));
@@ -422,8 +512,10 @@ async function processArchive(zipPath) {
               }
 
               const mdBuf = fs.readFileSync(path.join(partPath, partMdFiles[0]));
-              const firstHeading = mdBuf.toString('utf8').split('\n')[0].replace(/^#+\s*/, '');
-              const description = partInfo.description || firstHeading || partTitle;
+              const partFm = parseFrontMatter(mdBuf.toString('utf8'));
+              const resolvedTitle = partFm.title || partInfo.title || partFolderTitle;
+              const productTitle = `${seriesTitle}: ${resolvedTitle}`;
+              const description = partInfo.description || partFm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || resolvedTitle;
 
               await sanoraCreateProduct(tenant, productTitle, 'post', description, 0, 0,
                 `post,blog,series:${seriesTitle},part:${partIndex + 1},order:${order}`);
@@ -431,9 +523,10 @@ async function processArchive(zipPath) {
               await sanoraUploadArtifact(tenant, productTitle, mdBuf, partMdFiles[0], 'text');
 
               const partCovers = fs.readdirSync(partPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
-              if (partCovers.length > 0) {
-                const coverBuf = fs.readFileSync(path.join(partPath, partCovers[0]));
-                await sanoraUploadImage(tenant, productTitle, coverBuf, partCovers[0]);
+              const partCoverFile = partFm.preview ? (partCovers.find(f => f === partFm.preview) || partCovers[0]) : partCovers[0];
+              if (partCoverFile) {
+                const coverBuf = fs.readFileSync(path.join(partPath, partCoverFile));
+                await sanoraUploadImage(tenant, productTitle, coverBuf, partCoverFile);
               }
 
               const partAssets = fs.readdirSync(partPath).filter(f =>
@@ -445,7 +538,7 @@ async function processArchive(zipPath) {
                 await sanoraUploadArtifact(tenant, productTitle, buf, asset, 'image');
               }
 
-              console.log(`[shoppe]     part ${partIndex + 1}: ${partTitle}`);
+              console.log(`[shoppe]     part ${partIndex + 1}: ${resolvedTitle}`);
             } catch (err) {
               console.warn(`[shoppe]   ⚠️  part ${partEntry}: ${err.message}`);
             }
@@ -461,17 +554,19 @@ async function processArchive(zipPath) {
               continue;
             }
             const mdBuf = fs.readFileSync(path.join(entryPath, mdFiles[0]));
-            const firstHeading = mdBuf.toString('utf8').split('\n')[0].replace(/^#+\s*/, '');
-            const title = info.title || folderTitle;
-            const description = info.description || firstHeading || title;
+            const fm = parseFrontMatter(mdBuf.toString('utf8'));
+            const title = fm.title || info.title || folderTitle;
+            const firstLine = fm.body.split('\n').find(l => l.trim()).replace(/^#+\s*/, '');
+            const description = info.description || fm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || firstLine || title;
 
             await sanoraCreateProduct(tenant, title, 'post', description, 0, 0, `post,blog,order:${order}`);
             await sanoraUploadArtifact(tenant, title, mdBuf, mdFiles[0], 'text');
 
             const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
-            if (covers.length > 0) {
-              const coverBuf = fs.readFileSync(path.join(entryPath, covers[0]));
-              await sanoraUploadImage(tenant, title, coverBuf, covers[0]);
+            const coverFile = fm.preview ? (covers.find(f => f === fm.preview) || covers[0]) : covers[0];
+            if (coverFile) {
+              const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+              await sanoraUploadImage(tenant, title, coverBuf, coverFile);
             }
 
             const assets = fs.readdirSync(entryPath).filter(f =>
@@ -494,7 +589,7 @@ async function processArchive(zipPath) {
 
     // ---- albums/ ----
     // Each subfolder is a photo album
-    const albumsDir = path.join(tmpDir, 'albums');
+    const albumsDir = path.join(root, 'albums');
     if (fs.existsSync(albumsDir)) {
       for (const entry of fs.readdirSync(albumsDir)) {
         const entryPath = path.join(albumsDir, entry);
@@ -520,16 +615,13 @@ async function processArchive(zipPath) {
 
     // ---- products/ ----
     // Each subfolder is a physical product with cover.jpg + info.json
-    const productsDir = path.join(tmpDir, 'products');
+    const productsDir = path.join(root, 'products');
     if (fs.existsSync(productsDir)) {
       for (const entry of fs.readdirSync(productsDir)) {
         const entryPath = path.join(productsDir, entry);
         if (!fs.statSync(entryPath).isDirectory()) continue;
         try {
-          const infoPath = path.join(entryPath, 'info.json');
-          const info = fs.existsSync(infoPath)
-            ? JSON.parse(fs.readFileSync(infoPath, 'utf8'))
-            : {};
+          const info = readInfo(entryPath);
           const title = info.title || entry;
           const description = info.description || '';
           const price = info.price || 0;
@@ -538,9 +630,10 @@ async function processArchive(zipPath) {
           await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, 'product,physical');
 
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
-          if (images.length > 0) {
-            const coverBuf = fs.readFileSync(path.join(entryPath, images[0]));
-            await sanoraUploadImage(tenant, title, coverBuf, images[0]);
+          const coverFile = info.cover ? (images.find(f => f === info.cover) || images[0]) : images[0];
+          if (coverFile) {
+            const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+            await sanoraUploadImage(tenant, title, coverBuf, coverFile);
           }
 
           results.products.push({ title, price, shipping });
@@ -572,13 +665,16 @@ async function getShoppeGoods(tenant) {
   const goods = { books: [], music: [], posts: [], albums: [], products: [] };
 
   for (const [title, product] of Object.entries(products)) {
+    const isPost = product.category === 'post' || product.category === 'post-series';
     const item = {
       title: product.title || title,
       description: product.description || '',
       price: product.price || 0,
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
-      url: `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
+      url: isPost
+        ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
+        : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
     };
     const bucket = goods[product.category];
     if (bucket) bucket.push(item);
@@ -690,6 +786,49 @@ function generateShoppeHTML(tenant, goods) {
 </html>`;
 }
 
+function generatePostHTML(tenant, title, date, imageUrl, markdownBody) {
+  const content = renderMarkdown(markdownBody);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escHtml(title)} — ${escHtml(tenant.name)}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f7; color: #1d1d1f; }
+    .back-bar { background: #1a1a2e; padding: 12px 24px; }
+    .back-bar a { color: rgba(255,255,255,0.75); text-decoration: none; font-size: 14px; }
+    .back-bar a:hover { color: white; }
+    .hero { width: 100%; max-height: 420px; object-fit: cover; display: block; }
+    .post-header { max-width: 740px; margin: 48px auto 0; padding: 0 24px; }
+    .post-header h1 { font-size: 38px; font-weight: 800; line-height: 1.15; letter-spacing: -0.5px; }
+    .post-date { margin-top: 10px; font-size: 14px; color: #888; }
+    article { max-width: 740px; margin: 36px auto 80px; padding: 0 24px; line-height: 1.75; font-size: 17px; color: #2d2d2f; }
+    article h1,article h2,article h3,article h4 { margin: 2em 0 0.5em; line-height: 1.2; color: #1d1d1f; }
+    article h1 { font-size: 28px; } article h2 { font-size: 24px; } article h3 { font-size: 20px; }
+    article p { margin-bottom: 1.4em; }
+    article a { color: #0066cc; }
+    article code { background: #e8e8ed; border-radius: 4px; padding: 2px 6px; font-size: 14px; }
+    article pre { background: #1d1d1f; color: #a8f0a8; border-radius: 10px; padding: 20px; overflow-x: auto; margin: 1.5em 0; }
+    article pre code { background: none; padding: 0; font-size: 14px; color: inherit; }
+    article img { max-width: 100%; border-radius: 8px; margin: 1em 0; }
+    article hr { border: none; border-top: 1px solid #ddd; margin: 2.5em 0; }
+    article strong { color: #1d1d1f; }
+  </style>
+</head>
+<body>
+  <div class="back-bar"><a href="/plugin/shoppe/${tenant.uuid}">← ${escHtml(tenant.name)}</a></div>
+  ${imageUrl ? `<img class="hero" src="${imageUrl}" alt="">` : ''}
+  <div class="post-header">
+    <h1>${escHtml(title)}</h1>
+    ${date ? `<div class="post-date">${escHtml(date)}</div>` : ''}
+  </div>
+  <article>${content}</article>
+</body>
+</html>`;
+}
+
 // ============================================================
 // EXPRESS ROUTES
 // ============================================================
@@ -697,7 +836,8 @@ function generateShoppeHTML(tenant, goods) {
 async function startServer(params) {
   const app = params.app;
 
-  if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(TMP_DIR))  fs.mkdirSync(TMP_DIR,  { recursive: true });
   console.log('🛍️  wiki-plugin-shoppe starting...');
 
   const owner = (req, res, next) => {
@@ -777,6 +917,39 @@ async function startServer(params) {
     saveConfig(config);
     console.log('[shoppe] Sanora URL set to:', sanoraUrl);
     res.json({ success: true });
+  });
+
+  // Post reader — fetches markdown from Sanora and renders it as HTML
+  app.get('/plugin/shoppe/:identifier/post/:title', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const title = decodeURIComponent(req.params.title);
+      const productsResp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title];
+      if (!product) return res.status(404).send('<h1>Post not found</h1>');
+
+      // Find the markdown artifact (UUID-named .md file)
+      const mdArtifact = (product.artifacts || []).find(a => a.endsWith('.md'));
+      let mdContent = '';
+      if (mdArtifact) {
+        const artResp = await fetch(`${getSanoraUrl()}/artifacts/${mdArtifact}`);
+        mdContent = await artResp.text();
+      }
+
+      const fm = parseFrontMatter(mdContent);
+      const postTitle = fm.title || title;
+      const postDate  = fm.date || '';
+      const imageUrl  = product.image ? `${getSanoraUrl()}/images/${product.image}` : null;
+
+      res.set('Content-Type', 'text/html');
+      res.send(generatePostHTML(tenant, postTitle, postDate, imageUrl, fm.body || mdContent));
+    } catch (err) {
+      console.error('[shoppe] post page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
   });
 
   // Goods JSON (public)
