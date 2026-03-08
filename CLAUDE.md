@@ -65,8 +65,8 @@ my-shoppe.zip
       photo1.jpg
       photo2.jpg
   products/
-    T-Shirt/              ← product = subfolder with cover + info.json
-      cover.jpg
+    01-T-Shirt/           ← numeric prefix sets display order
+      hero.jpg            ← main product image (hero.jpg or hero.png)
       info.json
 ```
 
@@ -135,10 +135,11 @@ preview = "ocean.jpg"
   "title": "Planet Nine T-Shirt",
   "description": "Comfortable cotton tee with logo",
   "price": 25,
-  "shipping": 5,
-  "cover": "front.jpg"
+  "shipping": 5
 }
 ```
+
+The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if present, otherwise the first image in the folder. Folder numeric prefix (`01-`, `02-`, …) sets display order.
 
 ## Routes
 

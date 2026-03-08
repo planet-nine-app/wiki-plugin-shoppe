@@ -614,30 +614,37 @@ async function processArchive(zipPath) {
     }
 
     // ---- products/ ----
-    // Each subfolder is a physical product with cover.jpg + info.json
+    // Each subfolder is a physical product with hero.jpg/hero.png + info.json.
+    // Numeric prefix on folder name sets display order (01-T-Shirt, 02-Hat, …).
     const productsDir = path.join(root, 'products');
     if (fs.existsSync(productsDir)) {
-      for (const entry of fs.readdirSync(productsDir)) {
+      const productFolders = fs.readdirSync(productsDir)
+        .filter(f => fs.statSync(path.join(productsDir, f)).isDirectory())
+        .sort();
+
+      for (let order = 0; order < productFolders.length; order++) {
+        const entry = productFolders[order];
         const entryPath = path.join(productsDir, entry);
-        if (!fs.statSync(entryPath).isDirectory()) continue;
+        const folderTitle = entry.replace(/^\d+-/, '');
         try {
           const info = readInfo(entryPath);
-          const title = info.title || entry;
+          const title = info.title || folderTitle;
           const description = info.description || '';
           const price = info.price || 0;
           const shipping = info.shipping || 0;
 
-          await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, 'product,physical');
+          await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, `product,physical,order:${order}`);
 
+          // Hero image: prefer hero.jpg / hero.png, fall back to first image
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
-          const coverFile = info.cover ? (images.find(f => f === info.cover) || images[0]) : images[0];
-          if (coverFile) {
-            const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
-            await sanoraUploadImage(tenant, title, coverBuf, coverFile);
+          const heroFile = images.find(f => /^hero\.(jpg|jpeg|png|webp)$/i.test(f)) || images[0];
+          if (heroFile) {
+            const heroBuf = fs.readFileSync(path.join(entryPath, heroFile));
+            await sanoraUploadImage(tenant, title, heroBuf, heroFile);
           }
 
-          results.products.push({ title, price, shipping });
-          console.log(`[shoppe]   📦 product: ${title} ($${price} + $${shipping} shipping)`);
+          results.products.push({ title, order, price, shipping });
+          console.log(`[shoppe]   📦 product [${order + 1}]: ${title} ($${price} + $${shipping} shipping)`);
         } catch (err) {
           console.warn(`[shoppe]   ⚠️  product ${entry}: ${err.message}`);
         }
