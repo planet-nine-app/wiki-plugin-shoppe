@@ -4,11 +4,12 @@
   <script src="https://js.stripe.com/v3/"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <meta name="twitter:title" content="Support: {{title}}">
+  <meta name="twitter:title" content="Infuse: {{title}}">
   <meta name="description" content="{{description}}">
-  <meta name="og:title" content="Support: {{title}}">
+  <meta name="keywords" content="{{keywords}}">
+  <meta name="og:title" content="Infuse: {{title}}">
   <meta name="og:description" content="{{description}}">
-  <title>Support: {{title}}</title>
+  <title>Infuse: {{title}}</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: white; min-height: 100vh; }
@@ -97,13 +98,13 @@
   <div class="pay-panel">
 
     <div id="already-subscribed">
-      <h3>✅ You're already a supporter!</h3>
+      <h3>✅ You're already infusing!</h3>
       <p id="already-desc"></p>
       <button class="btn-outline" onclick="window.location.href='{{shoppeUrl}}/membership'">View your membership →</button>
     </div>
 
     <div id="subscribe-form">
-      <h2>Become a supporter</h2>
+      <h2>Become an infuser</h2>
       <div class="subtitle">Use a recovery key to access your membership and exclusive content.</div>
 
       <div class="recovery-note">
@@ -120,7 +121,7 @@
     </div>
 
     <div id="payment-section">
-      <h2>Complete your support</h2>
+      <h2>Complete your infusion</h2>
       <div class="subtitle">${{formattedAmount}}/month · renews every {{renewalDays}} days</div>
       <div id="payment-element"></div>
       <button class="btn-primary" id="pay-btn" onclick="confirmPayment()">Pay ${{formattedAmount}}</button>
@@ -130,7 +131,7 @@
 
     <div id="confirmation">
       <div class="icon">🎉</div>
-      <h2>Thank you for your support!</h2>
+      <h2>Thank you for infusing!</h2>
       <div class="renews" id="renews-display"></div>
       <p>Use your recovery key any time at the <a href="{{shoppeUrl}}/membership" style="color:#7ec8e3;">membership portal</a> to access exclusive content and check your subscription status.</p>
       <p style="margin-top:12px;font-size:12px;color:#555;">Keep your recovery key safe — it's the only way to access your membership benefits.</p>

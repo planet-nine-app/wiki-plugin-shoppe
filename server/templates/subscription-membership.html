@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <title>Membership Portal</title>
+  <title>Infuse Portal</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: white; min-height: 100vh; }
@@ -75,14 +75,14 @@
 </head>
 <body>
   <header>
-    <h1>🎁 Membership Portal</h1>
-    <p>Enter your recovery key to access your membership benefits</p>
+    <h1>🎁 Infuse Portal</h1>
+    <p>Enter your recovery key to access your infuser benefits</p>
   </header>
 
   <div class="container">
 
     <div id="key-section">
-      <h2>Check your membership</h2>
+      <h2>Check your infusions</h2>
       <p>Enter the recovery key you used when you subscribed.</p>
       <div class="input-row">
         <input type="text" id="recovery-key" placeholder="Your recovery key…" autocomplete="off" onkeydown="if(event.key==='Enter')checkMembership()">
@@ -161,8 +161,8 @@
 
       const activeCount = subscriptions.filter(s => s.active).length;
       heading.textContent = activeCount > 0
-        ? `You have ${activeCount} active membership${activeCount !== 1 ? 's' : ''}`
-        : 'No active memberships found';
+        ? `You have ${activeCount} active infusion${activeCount !== 1 ? 's' : ''}`
+        : 'No active infusions found';
 
       container.innerHTML = '';
 
@@ -278,7 +278,7 @@
         const price = (sub.price / 100).toFixed(2);
         cta.innerHTML = `
           <a class="btn-subscribe" href="${sub.subscribeUrl}">
-            ${sub.renewsAt ? 'Renew' : 'Subscribe'} — $${price}/month
+            ${sub.renewsAt ? 'Renew' : 'Infuse'} — $${price}/month
           </a>
         `;
         body.appendChild(cta);

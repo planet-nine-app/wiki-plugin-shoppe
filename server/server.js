@@ -48,6 +48,12 @@ function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
+// Derive the public-facing protocol from the request, respecting reverse-proxy headers.
+// Behind HTTPS proxies req.protocol is 'http'; X-Forwarded-Proto carries the real value.
+function reqProto(req) {
+  return (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+}
+
 function getSanoraUrl() {
   const config = loadConfig();
   if (config.sanoraUrl) return config.sanoraUrl.replace(/\/$/, '');
@@ -133,6 +139,22 @@ function parseFrontMatter(content) {
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Extract kw:-prefixed entries from a Sanora product's tags string into a comma-separated keyword list.
+function extractKeywords(product) {
+  return (product.tags || '').split(',')
+    .filter(t => t.startsWith('kw:'))
+    .map(t => t.slice(3).trim())
+    .join(', ');
+}
+
+// Append keyword tags (as kw:word entries) to a base tags string.
+function buildTags(baseTags, keywords) {
+  const kwTags = (Array.isArray(keywords) ? keywords : [])
+    .map(kw => `kw:${kw.trim()}`).filter(Boolean);
+  if (!kwTags.length) return baseTags;
+  return baseTags + ',' + kwTags.join(',');
 }
 
 function renderMarkdown(md) {
@@ -427,6 +449,21 @@ async function processArchive(zipPath) {
       throw new Error('emojicode does not match registered tenant');
     }
 
+    // Store manifest-level keywords and per-category redirect URLs in the tenant record.
+    const tenantUpdates = {};
+    if (Array.isArray(manifest.keywords) && manifest.keywords.length > 0) {
+      tenantUpdates.keywords = manifest.keywords.join(', ');
+    }
+    if (manifest.redirects && typeof manifest.redirects === 'object') {
+      tenantUpdates.redirects = manifest.redirects;
+    }
+    if (Object.keys(tenantUpdates).length > 0) {
+      const tenants = loadTenants();
+      Object.assign(tenants[tenant.uuid], tenantUpdates);
+      saveTenants(tenants);
+      Object.assign(tenant, tenantUpdates);
+    }
+
     const results = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [], warnings: [] };
 
     function readInfo(entryPath) {
@@ -455,7 +492,7 @@ async function processArchive(zipPath) {
           const description = info.description || '';
           const price = info.price || 0;
 
-          await sanoraCreateProduct(tenant, title, 'book', description, price, 0, 'book');
+          await sanoraCreateProduct(tenant, title, 'book', description, price, 0, buildTags('book', info.keywords));
 
           // Cover image — use info.cover to pin a specific file, else first image found
           const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -497,7 +534,7 @@ async function processArchive(zipPath) {
           try {
             const description = info.description || `Album: ${albumTitle}`;
             const price = info.price || 0;
-            await sanoraCreateProduct(tenant, albumTitle, 'music', description, price, 0, 'music,album');
+            await sanoraCreateProduct(tenant, albumTitle, 'music', description, price, 0, buildTags('music,album', info.keywords));
             const coverFile = info.cover ? (covers.find(f => f === info.cover) || covers[0]) : covers[0];
             if (coverFile) {
               const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
@@ -526,7 +563,7 @@ async function processArchive(zipPath) {
             const buf = fs.readFileSync(entryPath);
             const description = trackInfo.description || `Track: ${title}`;
             const price = trackInfo.price || 0;
-            await sanoraCreateProduct(tenant, title, 'music', description, price, 0, 'music,track');
+            await sanoraCreateProduct(tenant, title, 'music', description, price, 0, buildTags('music,track', trackInfo.keywords));
             await sanoraUploadArtifact(tenant, title, buf, entry, 'audio');
             results.music.push({ title, type: 'track' });
             console.log(`[shoppe]   🎵 track: ${title}`);
@@ -566,7 +603,7 @@ async function processArchive(zipPath) {
           // Register the series itself as a parent product
           try {
             const description = info.description || `A ${subDirs.length}-part series`;
-            await sanoraCreateProduct(tenant, seriesTitle, 'post-series', description, 0, 0, `post,series,order:${order}`);
+            await sanoraCreateProduct(tenant, seriesTitle, 'post-series', description, 0, 0, buildTags(`post,series,order:${order}`, info.keywords));
 
             const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
             if (covers.length > 0) {
@@ -607,7 +644,7 @@ async function processArchive(zipPath) {
               const description = partInfo.description || partFm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || resolvedTitle;
 
               await sanoraCreateProduct(tenant, productTitle, 'post', description, 0, 0,
-                `post,blog,series:${seriesTitle},part:${partIndex + 1},order:${order}`);
+                buildTags(`post,blog,series:${seriesTitle},part:${partIndex + 1},order:${order}`, partInfo.keywords));
 
               await sanoraUploadArtifact(tenant, productTitle, mdBuf, partMdFiles[0], 'text');
 
@@ -648,7 +685,7 @@ async function processArchive(zipPath) {
             const firstLine = fm.body.split('\n').find(l => l.trim()).replace(/^#+\s*/, '');
             const description = info.description || fm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || firstLine || title;
 
-            await sanoraCreateProduct(tenant, title, 'post', description, 0, 0, `post,blog,order:${order}`);
+            await sanoraCreateProduct(tenant, title, 'post', description, 0, 0, buildTags(`post,blog,order:${order}`, info.keywords));
             await sanoraUploadArtifact(tenant, title, mdBuf, mdFiles[0], 'text');
 
             const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -722,7 +759,7 @@ async function processArchive(zipPath) {
           const price = info.price || 0;
           const shipping = info.shipping || 0;
 
-          await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, `product,physical,order:${order}`);
+          await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, buildTags(`product,physical,order:${order}`, info.keywords));
 
           // Hero image: prefer hero.jpg / hero.png, fall back to first image
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -763,7 +800,7 @@ async function processArchive(zipPath) {
             renewalDays: info.renewalDays || 30
           };
 
-          await sanoraCreateProduct(tenant, title, 'subscription', description, price, 0, 'subscription');
+          await sanoraCreateProduct(tenant, title, 'subscription', description, price, 0, buildTags('subscription', info.keywords));
 
           // Upload tier metadata (benefits list, renewal period) as a JSON artifact
           const tierBuf = Buffer.from(JSON.stringify(tierMeta));
@@ -819,7 +856,7 @@ async function processArchive(zipPath) {
             advanceDays:  info.advanceDays  || 30
           };
 
-          await sanoraCreateProduct(tenant, title, 'appointment', description, price, 0, 'appointment');
+          await sanoraCreateProduct(tenant, title, 'appointment', description, price, 0, buildTags('appointment', info.keywords));
 
           // Upload schedule as a JSON artifact so the booking page can retrieve it
           const scheduleBuf = Buffer.from(JSON.stringify(schedule));
@@ -858,33 +895,38 @@ async function processArchive(zipPath) {
 async function getShoppeGoods(tenant) {
   const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
   const products = await resp.json();
+  const redirects = tenant.redirects || {};
 
   const goods = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [] };
 
+  const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products', appointment: 'appointments', subscription: 'subscriptions' };
+
   for (const [title, product] of Object.entries(products)) {
     const isPost = product.category === 'post' || product.category === 'post-series';
+    const bucketName = CATEGORY_BUCKET[product.category];
+    const defaultUrl = isPost
+      ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
+      : product.category === 'book'
+        ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+        : product.category === 'subscription'
+          ? `/plugin/shoppe/${tenant.uuid}/subscribe/${encodeURIComponent(title)}`
+          : product.category === 'appointment'
+            ? `/plugin/shoppe/${tenant.uuid}/book/${encodeURIComponent(title)}`
+          : product.category === 'product' && product.shipping > 0
+            ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
+            : product.category === 'product'
+              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+              : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
+
     const item = {
       title: product.title || title,
       description: product.description || '',
       price: product.price || 0,
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
-      url: isPost
-        ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
-        : product.category === 'book'
-          ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
-          : product.category === 'subscription'
-            ? `/plugin/shoppe/${tenant.uuid}/subscribe/${encodeURIComponent(title)}`
-            : product.category === 'appointment'
-              ? `/plugin/shoppe/${tenant.uuid}/book/${encodeURIComponent(title)}`
-            : product.category === 'product' && product.shipping > 0
-              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
-              : product.category === 'product'
-                ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
-                : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
+      url: (bucketName && redirects[bucketName]) || defaultUrl
     };
-    const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products', appointment: 'appointments', subscription: 'subscriptions' };
-    const bucket = goods[CATEGORY_BUCKET[product.category]];
+    const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
   }
 
@@ -1044,7 +1086,7 @@ function generateShoppeHTML(tenant, goods) {
     { id: 'albums',       label: '🖼️ Albums',         count: goods.albums.length },
     { id: 'products',     label: '📦 Products',       count: goods.products.length },
     { id: 'appointments',  label: '📅 Appointments',  count: goods.appointments.length },
-    { id: 'subscriptions', label: '🎁 Support',        count: goods.subscriptions.length }
+    { id: 'subscriptions', label: '🎁 Infuse',          count: goods.subscriptions.length }
   ]
     .filter(t => t.always || t.count > 0)
     .map((t, i) => `<div class="tab${i === 0 ? ' active' : ''}" onclick="show('${t.id}',this)">${t.label} <span class="badge">${t.count}</span></div>`)
@@ -1058,6 +1100,7 @@ function generateShoppeHTML(tenant, goods) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${tenant.name}</title>
+  ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f7; color: #1d1d1f; }
@@ -1103,7 +1146,7 @@ function generateShoppeHTML(tenant, goods) {
     <div id="appointments" class="section"><div class="grid">${renderCards(goods.appointments, 'appointment')}</div></div>
     <div id="subscriptions" class="section"><div class="grid">${renderCards(goods.subscriptions, 'subscription')}</div></div>
     <div style="text-align:center;padding:24px 0 8px;font-size:14px;color:#888;">
-      Already a supporter? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+      Already infusing? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
     </div>
   </main>
   <script>
@@ -1260,7 +1303,7 @@ async function startServer(params) {
 
       const title = decodeURIComponent(req.params.title);
       const sanoraUrlInternal = getSanoraUrl();
-      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const sanoraUrl = `${wikiOrigin}/plugin/allyabase/sanora`;
       const productsResp = await fetch(`${sanoraUrlInternal}/products/${tenant.uuid}`);
       const products = await productsResp.json();
@@ -1288,7 +1331,8 @@ async function startServer(params) {
         ebookUrl,
         shoppeUrl,
         payees,
-        tenantUuid:      tenant.uuid
+        tenantUuid:      tenant.uuid,
+        keywords:        extractKeywords(product)
       });
 
       res.set('Content-Type', 'text/html');
@@ -1321,7 +1365,7 @@ async function startServer(params) {
       if (!product) return res.status(404).send('<h1>Appointment not found</h1>');
 
       const schedule = await getAppointmentSchedule(tenant, product);
-      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
       const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
 
@@ -1337,7 +1381,8 @@ async function startServer(params) {
         duration:        String(schedule ? schedule.duration : 60),
         proceedLabel:    price === 0 ? 'Confirm Booking →' : 'Continue to Payment →',
         shoppeUrl,
-        tenantUuid:      tenant.uuid
+        tenantUuid:      tenant.uuid,
+        keywords:        extractKeywords(product)
       });
 
       res.set('Content-Type', 'text/html');
@@ -1388,7 +1433,7 @@ async function startServer(params) {
       if (!product) return res.status(404).send('<h1>Tier not found</h1>');
 
       const tierInfo = await getTierInfo(tenant, product);
-      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
       const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
       const benefits = tierInfo && tierInfo.benefits
@@ -1405,7 +1450,8 @@ async function startServer(params) {
         benefits,
         renewalDays:     String(tierInfo ? (tierInfo.renewalDays || 30) : 30),
         shoppeUrl,
-        tenantUuid:      tenant.uuid
+        tenantUuid:      tenant.uuid,
+        keywords:        extractKeywords(product)
       });
 
       res.set('Content-Type', 'text/html');
@@ -1420,7 +1466,7 @@ async function startServer(params) {
   app.get('/plugin/shoppe/:identifier/membership', (req, res) => {
     const tenant = getTenantByIdentifier(req.params.identifier);
     if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
-    const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+    const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
     const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
     const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { shoppeUrl, tenantUuid: tenant.uuid });
     res.set('Content-Type', 'text/html');
@@ -1439,7 +1485,7 @@ async function startServer(params) {
       const sanoraUrl = getSanoraUrl();
       const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
       const products = await productsResp.json();
-      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
 
       const subscriptions = [];

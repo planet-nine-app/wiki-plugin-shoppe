@@ -17,7 +17,7 @@
             .sw-step-body { font-size: 14px; line-height: 1.5; color: #333; }
             .sw-step-body strong { color: #1d1d1f; }
             .sw-step-body code { background: #e8e8ed; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
-            .sw-tree { font-family: monospace; font-size: 12px; background: #1d1d1f; color: #a8f0a8; border-radius: 8px; padding: 14px 16px; line-height: 1.7; white-space: pre; overflow-x: auto; margin-top: 8px; }
+            .sw-tree { font-family: monospace; font-size: 12px; background: #1d1d1f; color: #a8f0a8; border-radius: 8px; padding: 14px 16px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; margin-top: 8px; }
             .sw-shoppe { display: flex; align-items: center; justify-content: space-between; background: white; border: 1px solid #e5e5ea; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; }
             .sw-shoppe-left { display: flex; flex-direction: column; gap: 2px; }
             .sw-shoppe-name { font-weight: 600; font-size: 15px; }
@@ -94,7 +94,23 @@
   products/
     T-Shirt/          ← subfolder = physical product
       cover.jpg
-      info.json       ← { "title": "…", "description": "…", "price": 25, "shipping": 5 }</div>
+      info.json       ← { "title": "…", "description": "…", "price": 25, "shipping": 5 }
+  appointments/
+    Office Hours/     ← subfolder = bookable appointment type
+      cover.jpg
+      info.json       ← { "title": "…", "description": "…", "price": 0, "duration": 30,
+                           "timezone": "America/Chicago", "advanceDays": 21,
+                           "availability": [
+                             { "day": "Monday", "slots": ["09:00", "10:00", "11:00"] },
+                             { "day": "Friday", "slots": ["14:00", "15:00"] }
+                           ] }
+  subscriptions/
+    Bronze Tier/      ← subfolder = infuse tier
+      cover.jpg
+      info.json       ← { "title": "…", "description": "…", "price": 500,
+                           "renewalDays": 30,
+                           "benefits": ["Early access", "Monthly exclusive track"] }
+      bonus.mp3       ← any extra files become exclusive content for infusers</div>
                 </div>
               </div>
               <div class="sw-step">

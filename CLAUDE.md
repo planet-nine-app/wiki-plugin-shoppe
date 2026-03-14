@@ -86,7 +86,24 @@ my-shoppe.zip
 {
   "uuid": "your-uuid-from-registration",
   "emojicode": "🛍️🎨🎁🌟💎🐉📚🔥",
-  "name": "My Shoppe"
+  "name": "My Shoppe",
+  "keywords": ["digital goods", "indie creator", "music", "books"]
+}
+```
+
+`keywords` is optional. When present, it is stored in the tenant record and rendered as a `<meta name="keywords">` tag on the main shoppe page.
+
+`redirects` is optional. Each key is a content category (`books`, `music`, `posts`, `albums`, `products`, `appointments`, `subscriptions`) and the value is an external URL. When set, clicking any card in that category sends visitors to that URL instead of the plugin's built-in purchase/download pages. Example:
+
+```json
+{
+  "uuid": "...",
+  "emojicode": "...",
+  "name": "My Shoppe",
+  "redirects": {
+    "books": "https://myauthorsite.com/books",
+    "music": "https://mybandcamp.com"
+  }
 }
 ```
 
@@ -97,9 +114,12 @@ my-shoppe.zip
   "title": "My Novel",
   "description": "A gripping tale",
   "price": 9,
-  "cover": "front.jpg"
+  "cover": "front.jpg",
+  "keywords": ["fiction", "thriller", "indie author"]
 }
 ```
+
+`keywords` is optional on all `info.json` files. Values are stored as `kw:`-prefixed entries in Sanora's product tags and rendered as `<meta name="keywords">` on that product's pages.
 
 `cover` pins a specific image file as the Sanora cover image. If omitted, the first image in the folder is used.
 
