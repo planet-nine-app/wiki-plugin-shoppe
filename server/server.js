@@ -1105,8 +1105,17 @@ async function processArchive(zipPath) {
           const price = info.price || 0;
           const tags = info.tags || [];
 
+          // Compute Lucille videoId deterministically (sha256(lucilleUuid + title))
+          // so we can embed it in the Sanora product tags before calling Lucille.
+          const lucilleBase = (effectiveLucilleUrl || getLucilleUrl()).replace(/\/$/, '');
+          const lucilleVideoId = tenant.lucilleKeys
+            ? crypto.createHash('sha256').update(tenant.lucilleKeys.uuid + title).digest('hex')
+            : null;
+          const videoTags = buildTags('video', info.keywords) +
+            (lucilleVideoId ? `,lucille-id:${lucilleVideoId},lucille-url:${lucilleBase}` : '');
+
           // Sanora catalog entry (for discovery / storefront)
-          await sanoraCreateProduct(tenant, title, 'video', description, price, 0, buildTags('video', info.keywords));
+          await sanoraCreateProduct(tenant, title, 'video', description, price, 0, videoTags);
 
           // Cover / poster image (optional)
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -1209,13 +1218,27 @@ async function getShoppeGoods(tenant) {
   const products = await resp.json();
   const redirects = tenant.redirects || {};
 
-  const goods = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [] };
+  const goods = { books: [], music: [], posts: [], albums: [], products: [], videos: [], appointments: [], subscriptions: [] };
 
-  const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products', appointment: 'appointments', subscription: 'subscriptions' };
+  const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products', video: 'videos', appointment: 'appointments', subscription: 'subscriptions' };
 
   for (const [title, product] of Object.entries(products)) {
     const isPost = product.category === 'post' || product.category === 'post-series';
     const bucketName = CATEGORY_BUCKET[product.category];
+
+    // Extract lucille-id and lucille-url from tags for video products
+    let lucillePlayerUrl = null;
+    if (product.category === 'video' && product.tags) {
+      const tagParts = product.tags.split(',');
+      const idTag  = tagParts.find(t => t.startsWith('lucille-id:'));
+      const urlTag = tagParts.find(t => t.startsWith('lucille-url:'));
+      if (idTag && urlTag) {
+        const videoId   = idTag.slice('lucille-id:'.length);
+        const lucilleBase = urlTag.slice('lucille-url:'.length);
+        lucillePlayerUrl = `${lucilleBase}/watch/${videoId}`;
+      }
+    }
+
     const defaultUrl = isPost
       ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
       : product.category === 'book'
@@ -1228,7 +1251,9 @@ async function getShoppeGoods(tenant) {
             ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
             : product.category === 'product'
               ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
-              : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
+              : product.category === 'video' && lucillePlayerUrl
+                ? lucillePlayerUrl
+                : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
 
     const item = {
       title: product.title || title,
@@ -1236,7 +1261,8 @@ async function getShoppeGoods(tenant) {
       price: product.price || 0,
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
-      url: (bucketName && redirects[bucketName]) || defaultUrl
+      url: (bucketName && redirects[bucketName]) || defaultUrl,
+      ...(lucillePlayerUrl && { lucillePlayerUrl })
     };
     const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
@@ -1363,7 +1389,7 @@ async function getSubscriptionStatus(tenant, productId, recoveryKey) {
   } catch { return { active: false }; }
 }
 
-const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼️', product: '📦', appointment: '📅', subscription: '🎁' };
+const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼️', product: '📦', appointment: '📅', subscription: '🎁', video: '🎬' };
 
 // ============================================================
 // OWNER ORDERS
@@ -1512,14 +1538,18 @@ function renderCards(items, category) {
     return '<p class="empty">Nothing here yet.</p>';
   }
   return items.map(item => {
+    const isVideo = !!item.lucillePlayerUrl;
     const imgHtml = item.image
-      ? `<div class="card-img"><img src="${item.image}" alt="" loading="lazy"></div>`
+      ? `<div class="card-img${isVideo ? ' card-video-play' : ''}"><img src="${item.image}" alt="" loading="lazy"></div>`
       : `<div class="card-img-placeholder">${CATEGORY_EMOJI[category] || '🎁'}</div>`;
     const priceHtml = (item.price > 0 || category === 'product')
       ? `<div class="price">$${(item.price / 100).toFixed(2)}${item.shipping ? ` <span class="shipping">+ $${(item.shipping / 100).toFixed(2)} shipping</span>` : ''}</div>`
       : '';
+    const clickHandler = isVideo
+      ? `playVideo('${item.lucillePlayerUrl}')`
+      : `window.open('${item.url}','_blank')`;
     return `
-      <div class="card" onclick="window.open('${item.url}','_blank')">
+      <div class="card" onclick="${clickHandler}">
         ${imgHtml}
         <div class="card-body">
           <div class="card-title">${item.title}</div>
@@ -1539,6 +1569,7 @@ function generateShoppeHTML(tenant, goods) {
     { id: 'posts',        label: '📝 Posts',          count: goods.posts.length },
     { id: 'albums',       label: '🖼️ Albums',         count: goods.albums.length },
     { id: 'products',     label: '📦 Products',       count: goods.products.length },
+    { id: 'videos',        label: '🎬 Videos',         count: goods.videos.length },
     { id: 'appointments',  label: '📅 Appointments',  count: goods.appointments.length },
     { id: 'subscriptions', label: '🎁 Infuse',          count: goods.subscriptions.length }
   ]
@@ -1546,7 +1577,7 @@ function generateShoppeHTML(tenant, goods) {
     .map((t, i) => `<div class="tab${i === 0 ? ' active' : ''}" onclick="show('${t.id}',this)">${t.label} <span class="badge">${t.count}</span></div>`)
     .join('');
 
-  const allItems = [...goods.books, ...goods.music, ...goods.posts, ...goods.albums, ...goods.products, ...goods.appointments, ...goods.subscriptions];
+  const allItems = [...goods.books, ...goods.music, ...goods.posts, ...goods.albums, ...goods.products, ...goods.videos, ...goods.appointments, ...goods.subscriptions];
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1581,6 +1612,16 @@ function generateShoppeHTML(tenant, goods) {
     .price { font-size: 15px; font-weight: 700; color: #0066cc; }
     .shipping { font-size: 12px; font-weight: 400; color: #888; }
     .empty { color: #999; text-align: center; padding: 60px 0; font-size: 15px; }
+    .card-video-play { position: relative; }
+    .card-video-play::after { content: '▶'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 36px; color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.35); opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+    .card:hover .card-video-play::after { opacity: 1; }
+    .video-modal { display: none; position: fixed; inset: 0; z-index: 1000; align-items: center; justify-content: center; }
+    .video-modal.open { display: flex; }
+    .video-modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.85); }
+    .video-modal-content { position: relative; z-index: 1; width: 90vw; max-width: 960px; aspect-ratio: 16/9; background: #000; border-radius: 10px; overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,0.6); }
+    .video-modal-content iframe { width: 100%; height: 100%; border: none; display: block; }
+    .video-modal-close { position: absolute; top: 10px; right: 12px; z-index: 2; background: rgba(0,0,0,0.5); border: none; color: #fff; font-size: 20px; line-height: 1; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+    .video-modal-close:hover { background: rgba(0,0,0,0.8); }
   </style>
 </head>
 <body>
@@ -1597,12 +1638,20 @@ function generateShoppeHTML(tenant, goods) {
     <div id="posts" class="section"><div class="grid">${renderCards(goods.posts, 'post')}</div></div>
     <div id="albums" class="section"><div class="grid">${renderCards(goods.albums, 'album')}</div></div>
     <div id="products" class="section"><div class="grid">${renderCards(goods.products, 'product')}</div></div>
+    <div id="videos" class="section"><div class="grid">${renderCards(goods.videos, 'video')}</div></div>
     <div id="appointments" class="section"><div class="grid">${renderCards(goods.appointments, 'appointment')}</div></div>
     <div id="subscriptions" class="section"><div class="grid">${renderCards(goods.subscriptions, 'subscription')}</div></div>
     <div style="text-align:center;padding:24px 0 8px;font-size:14px;color:#888;">
       Already infusing? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
     </div>
   </main>
+  <div id="video-modal" class="video-modal">
+    <div class="video-modal-backdrop" onclick="closeVideo()"></div>
+    <div class="video-modal-content">
+      <button class="video-modal-close" onclick="closeVideo()">✕</button>
+      <iframe id="video-iframe" src="" allowfullscreen allow="autoplay"></iframe>
+    </div>
+  </div>
   <script>
     function show(id, tab) {
       document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
@@ -1610,6 +1659,15 @@ function generateShoppeHTML(tenant, goods) {
       document.getElementById(id).classList.add('active');
       tab.classList.add('active');
     }
+    function playVideo(url) {
+      document.getElementById('video-iframe').src = url;
+      document.getElementById('video-modal').classList.add('open');
+    }
+    function closeVideo() {
+      document.getElementById('video-modal').classList.remove('open');
+      document.getElementById('video-iframe').src = '';
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeVideo(); });
   </script>
 </body>
 </html>`;
