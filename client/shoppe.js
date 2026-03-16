@@ -22,8 +22,11 @@
             .sw-shoppe-left { display: flex; flex-direction: column; gap: 2px; }
             .sw-shoppe-name { font-weight: 600; font-size: 15px; }
             .sw-shoppe-code { font-size: 18px; letter-spacing: 4px; }
+            .sw-shoppe-actions { display: flex; align-items: center; gap: 12px; }
             .sw-link { font-size: 13px; color: #0066cc; text-decoration: none; white-space: nowrap; }
             .sw-link:hover { text-decoration: underline; }
+            .sw-btn-delete { background: none; border: none; color: #cc0000; font-size: 13px; cursor: pointer; padding: 0; white-space: nowrap; }
+            .sw-btn-delete:hover { text-decoration: underline; }
             .sw-empty { font-size: 13px; color: #999; font-style: italic; }
             .sw-drop { border: 2px dashed #ccc; border-radius: 12px; padding: 28px 20px; text-align: center; background: #fafafa; transition: border-color 0.2s, background 0.2s; cursor: pointer; }
             .sw-drop.dragover { border-color: #0066cc; background: #e8f0fe; }
@@ -41,6 +44,8 @@
             .sw-status.success { background: #d1fae5; color: #065f46; display: block; }
             .sw-status.error   { background: #fee2e2; color: #991b1b; display: block; }
             .sw-status code { background: rgba(0,0,0,0.08); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+            .sw-remove { display: block; width: 100%; margin-top: 24px; padding: 8px; background: none; border: 1px solid #e5e5ea; border-radius: 8px; font-size: 12px; color: #aaa; cursor: pointer; text-align: center; }
+            .sw-remove:hover { border-color: #cc0000; color: #cc0000; }
           </style>
 
           <!-- Directory -->
@@ -161,37 +166,70 @@
             <div id="sw-register-status" class="sw-status"></div>
           </div>
 
+          <button class="sw-remove" id="sw-remove-btn">Remove plugin from page</button>
+
         </div>
       `;
 
+      div.querySelector('#sw-remove-btn').addEventListener('click', () => {
+        const $page = $item.parents('.page');
+        if (window.wiki && wiki.pageHandler && $page.length) {
+          wiki.pageHandler.put($page, { type: 'remove', id: item.id });
+          $item.remove();
+        } else if (window.wiki && wiki.textEditor) {
+          wiki.textEditor($item, item);
+        }
+      });
+
       setupListeners(div);
-      loadDirectory(div);
-      checkOwner(div);
+      checkOwner(div).then(isOwner => {
+        if (!isOwner) loadDirectory(div, false);
+      });
     },
 
-    bind: function($item, item) {}
+    bind: function($item, item) {
+      $item.on('dblclick', () => {
+        const $page = $item.parents('.page');
+        if (window.wiki && wiki.pageHandler && $page.length) {
+          wiki.pageHandler.put($page, { type: 'remove', id: item.id });
+          $item.remove();
+        } else if (window.wiki && wiki.textEditor) {
+          wiki.textEditor($item, item);
+        }
+      });
+    }
   };
 
-  // ── Directory (public) ──────────────────────────────────────────────────────
+  // ── Directory ────────────────────────────────────────────────────────────────
 
-  async function loadDirectory(container) {
+  async function loadDirectory(container, isOwner = false) {
     const el = container.querySelector('#sw-directory');
     try {
-      const resp = await fetch('/plugin/shoppe/directory');
+      const resp = await fetch(isOwner ? '/plugin/shoppe/tenants' : '/plugin/shoppe/directory');
       const result = await resp.json();
-      if (!result.success || result.shoppes.length === 0) {
+      const shoppes = isOwner ? result.tenants : result.shoppes;
+      if (!result.success || !shoppes || shoppes.length === 0) {
         el.innerHTML = '<em class="sw-empty">No shoppes yet — be the first!</em>';
         return;
       }
-      el.innerHTML = result.shoppes.map(s => `
-        <div class="sw-shoppe">
+      el.innerHTML = shoppes.map(s => `
+        <div class="sw-shoppe" id="sw-shoppe-${s.uuid}">
           <div class="sw-shoppe-left">
             <span class="sw-shoppe-name">${s.name}</span>
             <span class="sw-shoppe-code">${s.emojicode}</span>
           </div>
-          <a class="sw-link" href="${s.url}" target="_blank">Visit shoppe →</a>
+          <div class="sw-shoppe-actions">
+            <a class="sw-link" href="${s.url}" target="_blank">Visit shoppe →</a>
+            ${isOwner ? `<button class="sw-btn-delete" data-uuid="${s.uuid}" data-name="${s.name}">Delete</button>` : ''}
+          </div>
         </div>
       `).join('');
+
+      if (isOwner) {
+        el.querySelectorAll('.sw-btn-delete').forEach(btn => {
+          btn.addEventListener('click', () => deleteShoppe(btn.dataset.uuid, btn.dataset.name, container));
+        });
+      }
     } catch (err) {
       el.innerHTML = '<em class="sw-empty">Could not load directory.</em>';
     }
@@ -208,8 +246,30 @@
         if (result.sanoraUrl) {
           container.querySelector('#sw-url-input').value = result.sanoraUrl;
         }
+        loadDirectory(container, true);
+        return true;
       }
     } catch (err) { /* not owner, stay hidden */ }
+    return false;
+  }
+
+  // ── Delete shoppe (owner) ────────────────────────────────────────────────────
+
+  async function deleteShoppe(uuid, name, container) {
+    if (!confirm(`Delete "${name}"? This will remove the shoppe and all its products from Sanora.`)) return;
+
+    const row = container.querySelector(`#sw-shoppe-${uuid}`);
+    if (row) row.style.opacity = '0.4';
+
+    try {
+      const resp = await fetch(`/plugin/shoppe/${uuid}`, { method: 'DELETE' });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.error || 'Delete failed');
+      loadDirectory(container, true);
+    } catch (err) {
+      if (row) row.style.opacity = '1';
+      alert(`Could not delete shoppe: ${err.message}`);
+    }
   }
 
   // ── Listeners ───────────────────────────────────────────────────────────────

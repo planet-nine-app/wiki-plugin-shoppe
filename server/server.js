@@ -219,7 +219,7 @@ function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) 
     private: true,
     description: 'Shoppe content folder',
     dependencies: {
-      'sessionless-node': '^0.9.12'
+      'sessionless-node': 'latest'
     }
   }, null, 2);
 
@@ -260,6 +260,13 @@ function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) 
     '',
     'Add or update content, then run `node shoppe-sign.js` again.',
     'Each upload overwrites existing items and adds new ones.',
+    '',
+    '## Uploading videos',
+    '',
+    'Run: `node shoppe-sign.js upload`',
+    '',
+    'Opens your shoppe page with a signed URL (valid for 24 hours).',
+    'Any video items without a file will show an "Upload Video" button.',
     '',
     '## Viewing orders',
     '',
@@ -482,6 +489,7 @@ async function sanoraCreateProduct(tenant, title, category, description, price, 
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}`,
     {
       method: 'PUT',
+      timeout: 15000,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         timestamp,
@@ -515,6 +523,7 @@ async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifac
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}/artifact`,
     {
       method: 'PUT',
+      timeout: 30000,
       headers: {
         'x-pn-artifact-type': artifactType,
         'x-pn-timestamp': timestamp,
@@ -544,6 +553,7 @@ async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}/image`,
     {
       method: 'PUT',
+      timeout: 30000,
       headers: {
         'x-pn-timestamp': timestamp,
         'x-pn-signature': signature,
@@ -560,6 +570,20 @@ async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
 
 // ============================================================
 // LUCILLE HELPERS
+async function sanoraDeleteProduct(tenant, title) {
+  const { uuid, keys } = tenant;
+  const timestamp = Date.now().toString();
+  const message = timestamp + uuid + title;
+
+  sessionless.getKeys = () => keys;
+  const signature = await sessionless.sign(message);
+
+  await fetch(
+    `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`,
+    { method: 'DELETE' }
+  );
+}
+
 // ============================================================
 
 async function lucilleCreateUser(lucilleUrl) {
@@ -1383,12 +1407,12 @@ const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼
 // Validate an owner-signed request (used for browser-facing owner routes).
 // Expects req.query.timestamp and req.query.signature.
 // Returns an error string if invalid, null if valid.
-function checkOwnerSignature(req, tenant) {
+function checkOwnerSignature(req, tenant, maxAgeMs = 5 * 60 * 1000) {
   if (!tenant.ownerPubKey) return 'This shoppe was registered before owner signing was added';
   const { timestamp, signature } = req.query;
   if (!timestamp || !signature) return 'Missing timestamp or signature — generate a fresh URL with: node shoppe-sign.js orders';
   const age = Date.now() - parseInt(timestamp, 10);
-  if (isNaN(age) || age < 0 || age > 5 * 60 * 1000) return 'URL has expired — generate a new one with: node shoppe-sign.js orders';
+  if (isNaN(age) || age < 0 || age > maxAgeMs) return 'URL has expired — generate a new one with: node shoppe-sign.js orders';
   const message = timestamp + tenant.uuid;
   if (!sessionless.verifySignature(signature, message, tenant.ownerPubKey)) return 'Signature invalid';
   return null;
@@ -1568,7 +1592,7 @@ function renderCards(items, category) {
   }).join('');
 }
 
-function generateShoppeHTML(tenant, goods) {
+function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   const total = Object.values(goods).flat().length;
   const tabs = [
     { id: 'all',          label: 'All',              count: total,                       always: true },
@@ -1667,6 +1691,7 @@ function generateShoppeHTML(tenant, goods) {
     </div>
   </div>
   <script>
+    const UPLOAD_AUTH = ${uploadAuth ? JSON.stringify(uploadAuth) : 'null'};
     function show(id, tab) {
       document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1697,7 +1722,9 @@ function generateShoppeHTML(tenant, goods) {
       progressDiv.innerHTML = 'Getting upload credentials…';
 
       try {
-        const infoRes = await fetch('/plugin/shoppe/' + shoppeId + '/video/' + encodeURIComponent(title) + '/upload-info');
+        if (!UPLOAD_AUTH) throw new Error('Not authorized to upload — visit the shoppe via a signed URL (node shoppe-sign.js upload)');
+        const authParams = '?timestamp=' + encodeURIComponent(UPLOAD_AUTH.timestamp) + '&signature=' + encodeURIComponent(UPLOAD_AUTH.signature);
+        const infoRes = await fetch('/plugin/shoppe/' + shoppeId + '/video/' + encodeURIComponent(title) + '/upload-info' + authParams);
         if (!infoRes.ok) throw new Error('Could not get upload credentials (' + infoRes.status + ')');
         const { uploadUrl, timestamp, signature } = await infoRes.json();
 
@@ -1862,6 +1889,36 @@ async function startServer(params) {
       url: `/plugin/shoppe/${uuid}`
     }));
     res.json({ success: true, tenants: safe });
+  });
+
+  // Delete a shoppe tenant (owner only)
+  app.delete('/plugin/shoppe/:identifier', owner, async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'tenant not found' });
+
+      // Fetch all products from Sanora and fire-and-forget delete each one
+      const sanoraUrl = getSanoraUrl();
+      fetch(`${sanoraUrl}/products/${tenant.uuid}`)
+        .then(r => r.json())
+        .then(products => {
+          for (const title of Object.keys(products)) {
+            sanoraDeleteProduct(tenant, title).catch(err =>
+              console.warn(`[shoppe] delete product "${title}" failed:`, err.message)
+            );
+          }
+        })
+        .catch(err => console.warn('[shoppe] fetch products for delete failed:', err.message));
+
+      // Remove tenant from local registry
+      const tenants = loadTenants();
+      delete tenants[tenant.uuid];
+      saveTenants(tenants);
+
+      res.json({ success: true, deleted: tenant.uuid });
+    } catch (err) {
+      res.status(404).json({ error: err.message });
+    }
   });
 
   // Public directory — name, emojicode, and shoppe URL only
@@ -2537,12 +2594,18 @@ async function startServer(params) {
     }
   });
 
-  // GET /plugin/shoppe/:id/video/:title/upload-info (owner only)
+  // GET /plugin/shoppe/:id/video/:title/upload-info
   // Returns a pre-signed lucille upload URL so the browser can PUT the video file directly to lucille.
-  app.get('/plugin/shoppe/:identifier/video/:title/upload-info', owner, async (req, res) => {
+  // Auth: shoppe tenant owner signature (timestamp + uuid), valid for 24 hours.
+  // Generate the signed URL with: node shoppe-sign.js upload
+  app.get('/plugin/shoppe/:identifier/video/:title/upload-info', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'tenant not found' });
+
+      const sigErr = checkOwnerSignature(req, tenant, 24 * 60 * 60 * 1000);
+      if (sigErr) return res.status(403).json({ error: sigErr });
+
       if (!tenant.lucilleKeys) return res.status(400).json({ error: 'tenant has no lucille user — re-register' });
 
       const title = req.params.title;
@@ -2579,8 +2642,14 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
       const goods = await getShoppeGoods(tenant);
+
+      // Check if the request carries a valid owner signature — if so, embed auth
+      // params in the page so the upload button can authenticate with upload-info.
+      const sigErr = checkOwnerSignature(req, tenant, 24 * 60 * 60 * 1000);
+      const uploadAuth = sigErr ? null : { timestamp: req.query.timestamp, signature: req.query.signature };
+
       res.set('Content-Type', 'text/html');
-      res.send(generateShoppeHTML(tenant, goods));
+      res.send(generateShoppeHTML(tenant, goods, uploadAuth));
     } catch (err) {
       console.error('[shoppe] page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);

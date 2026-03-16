@@ -273,6 +273,71 @@ async function orders() {
   console.log('');
 }
 
+// ── upload — generate a signed shoppe URL for video uploading ────────────────
+
+async function upload() {
+  let sessionless;
+  try {
+    sessionless = require('sessionless-node');
+  } catch (err) {
+    console.error('❌  sessionless-node is not installed.');
+    console.error('   Run: npm install');
+    process.exit(1);
+  }
+
+  const manifest = readManifest();
+
+  if (!manifest.uuid) {
+    console.error('❌  manifest.json is missing uuid.');
+    process.exit(1);
+  }
+
+  if (fs.existsSync(LOCAL_KEY)) {
+    console.error('⚠️   shoppe-key.json is still in this folder.');
+    console.error('   Run  node shoppe-sign.js init  first.');
+    process.exit(1);
+  }
+
+  const keyData = loadStoredKey(manifest.uuid);
+
+  const timestamp = Date.now().toString();
+  const message   = timestamp + manifest.uuid;
+
+  sessionless.getKeys = () => ({ pubKey: keyData.pubKey, privateKey: keyData.privateKey });
+  const signature = await sessionless.sign(message);
+
+  const wikiUrlArg = process.argv[3];
+  const baseUrl    = wikiUrlArg
+    ? wikiUrlArg.replace(/\/+$/, '')
+    : manifest.wikiUrl
+      ? manifest.wikiUrl.replace(/\/plugin.*$/, '')
+      : null;
+
+  const shoppePath = `/plugin/shoppe/${manifest.uuid}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
+  const fullUrl    = baseUrl ? `${baseUrl}${shoppePath}` : null;
+
+  console.log('\n🎬  Signed shoppe URL for video uploading (valid for 24 hours):\n');
+  if (fullUrl) {
+    console.log('   ' + fullUrl);
+  } else {
+    console.log('   Path: ' + shoppePath);
+    console.log('\n   Prepend your wiki URL, e.g.:');
+    console.log('   https://mywiki.com' + shoppePath);
+    console.log('\n   Or pass your wiki URL as an argument:');
+    console.log('   node shoppe-sign.js upload https://mywiki.com');
+  }
+
+  if (fullUrl) {
+    console.log('\n   Opening in browser...');
+    try {
+      const open = process.platform === 'win32' ? 'start' :
+                   process.platform === 'darwin' ? 'open' : 'xdg-open';
+      execSync(`${open} "${fullUrl}"`, { stdio: 'ignore' });
+    } catch (_) {}
+  }
+  console.log('');
+}
+
 // ── payouts — open Stripe Connect Express onboarding ─────────────────────────
 
 async function payouts() {
@@ -347,6 +412,11 @@ async function payouts() {
 const command = process.argv[2];
 if (command === 'init') {
   init();
+} else if (command === 'upload') {
+  upload().catch(err => {
+    console.error('❌ ', err.message);
+    process.exit(1);
+  });
 } else if (command === 'orders') {
   orders().catch(err => {
     console.error('❌ ', err.message);
