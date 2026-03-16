@@ -1222,8 +1222,14 @@ async function processArchive(zipPath) {
 // ============================================================
 
 async function getShoppeGoods(tenant) {
-  const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
-  const products = await resp.json();
+  let products = {};
+  try {
+    const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`, { timeout: 15000 });
+    if (resp.ok) products = await resp.json();
+    else console.warn(`[shoppe] getShoppeGoods: Sanora returned ${resp.status} for ${tenant.uuid}`);
+  } catch (err) {
+    console.warn(`[shoppe] getShoppeGoods: Sanora unreachable — ${err.message}`);
+  }
   const redirects = tenant.redirects || {};
 
   const goods = { books: [], music: [], posts: [], albums: [], products: [], videos: [], appointments: [], subscriptions: [] };
@@ -1422,8 +1428,13 @@ function checkOwnerSignature(req, tenant, maxAgeMs = 5 * 60 * 1000) {
 // Returns an array of { product, orders } objects.
 async function getAllOrders(tenant) {
   const sanoraUrl  = getSanoraUrl();
-  const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
-  const products   = await productsResp.json();
+  let products = {};
+  try {
+    const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
+    if (productsResp.ok) products = await productsResp.json();
+  } catch (err) {
+    console.warn(`[shoppe] getAllOrders: Sanora unreachable — ${err.message}`);
+  }
 
   sessionless.getKeys = () => tenant.keys;
 
