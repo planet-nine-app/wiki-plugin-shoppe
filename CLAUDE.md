@@ -2,6 +2,8 @@
 
 Multi-tenant digital goods shoppe for Federated Wiki, powered by Sanora.
 
+**Current version**: 0.0.35
+
 ## Architecture
 
 Follows the Service-Bundling Plugin Pattern. Each tenant (seller/creator) gets their own Sanora user account, identified by a UUID and an 8-emoji emojicode (same format as BDO: 3 base + 5 unique from the EMOJI_PALETTE).
@@ -99,25 +101,16 @@ my-shoppe.zip
   "uuid": "your-uuid-from-registration",
   "emojicode": "🛍️🎨🎁🌟💎🐉📚🔥",
   "name": "My Shoppe",
-  "keywords": ["digital goods", "indie creator", "music", "books"]
+  "keywords": ["digital goods", "indie creator", "music", "books"],
+  "lightMode": false
 }
 ```
 
-`keywords` is optional. When present, it is stored in the tenant record and rendered as a `<meta name="keywords">` tag on the main shoppe page.
+`keywords` is optional. Stored in the tenant record and rendered as a `<meta name="keywords">` tag.
 
-`redirects` is optional. Each key is a content category (`books`, `music`, `posts`, `albums`, `products`, `appointments`, `subscriptions`) and the value is an external URL. When set, clicking any card in that category sends visitors to that URL instead of the plugin's built-in purchase/download pages. Example:
+`redirects` is optional. Each key is a content category and the value is an external URL. Clicking any card in that category sends visitors to that URL instead of the plugin's built-in pages.
 
-```json
-{
-  "uuid": "...",
-  "emojicode": "...",
-  "name": "My Shoppe",
-  "redirects": {
-    "books": "https://myauthorsite.com/books",
-    "music": "https://mybandcamp.com"
-  }
-}
-```
+`lightMode` is optional (default `false`). When `true`, the shoppe page uses light mode styling (white cards, `#f5f5f7` background, `#0066cc` accent). Default is dark mode (`#0f0f12` background, `#7ec8e3` accent). Stored in `tenants.json` and applied on every page load — no re-upload needed once set.
 
 ### books/*/info.json
 
@@ -183,6 +176,8 @@ preview = "ocean.jpg"
 
 The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if present, otherwise the first image in the folder. Folder numeric prefix (`01-`, `02-`, …) sets display order.
 
+**Note:** If the image upload fails (e.g. 413 from nginx), the product metadata is still recorded in Sanora and the upload result still counts as a success with a warning. Re-uploading the archive will push the image without duplicating the product entry.
+
 ### appointments/*/info.json
 
 ```json
@@ -226,13 +221,15 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 |--------|------|------|-------------|
 | `POST` | `/plugin/shoppe/register` | Owner | Register new tenant |
 | `GET`  | `/plugin/shoppe/tenants` | Owner | List all tenants |
-| `POST` | `/plugin/shoppe/upload` | UUID+emojicode in archive | Upload goods archive |
+| `POST` | `/plugin/shoppe/upload` | UUID+emojicode in archive | Upload goods archive (returns `{ jobId }` immediately) |
+| `GET`  | `/plugin/shoppe/upload/progress/:jobId` | Public | SSE stream of upload progress events |
 | `GET`  | `/plugin/shoppe/:id` | Public | Shoppe HTML page |
 | `GET`  | `/plugin/shoppe/:id/goods` | Public | Goods JSON |
 | `GET`  | `/plugin/shoppe/:id/goods?category=books` | Public | Filtered goods JSON |
-| `GET`  | `/plugin/shoppe/:id/book/:title` | Public | Appointment booking page |
+| `GET`  | `/plugin/shoppe/:id/music/feed` | Public | Music feed `{ albums, tracks }` built from Sanora products |
+| `GET`  | `/plugin/shoppe/:id/book/:title` | Public | Appointment booking page (standalone) |
 | `GET`  | `/plugin/shoppe/:id/book/:title/slots` | Public | Available slots JSON |
-| `GET`  | `/plugin/shoppe/:id/subscribe/:title` | Public | Subscription sign-up page |
+| `GET`  | `/plugin/shoppe/:id/subscribe/:title` | Public | Subscription sign-up page (standalone) |
 | `GET`  | `/plugin/shoppe/:id/membership` | Public | Membership portal |
 | `POST` | `/plugin/shoppe/:id/membership/check` | Public | Check subscription status |
 | `POST` | `/plugin/shoppe/:id/purchase/intent` | Public | Create Stripe payment intent |
@@ -245,12 +242,88 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 
 `:id` accepts either UUID or emojicode.
 
+## Upload Flow (SSE Progress)
+
+The upload endpoint is non-blocking. The client POSTs the archive and immediately gets `{ jobId }`. It then opens an `EventSource` to `/plugin/shoppe/upload/progress/:jobId` and receives a stream of events:
+
+| Event | Data |
+|-------|------|
+| `start` | `{ total, name }` — total item count and shoppe name |
+| `progress` | `{ current, total, label }` — item number and human-readable label |
+| `warning` | `{ message }` — non-fatal issue (e.g. image upload failed) |
+| `complete` | `{ success, books, music, posts, … }` — final result counts |
+| `error` | `{ message }` — fatal upload failure |
+
+The progress stream is buffered for late-connecting clients. Jobs are cleaned up after 15 minutes.
+
+## Shoppe Page UI
+
+The shoppe page is a single-page app generated server-side by `generateShoppeHTML`. All tabs are lazy-initialized on first open.
+
+### Tabs and their UI patterns
+
+| Tab | Pattern |
+|-----|---------|
+| All | Card grid of everything |
+| Books | Card grid → buy page |
+| Music | Album grid → track list → fixed player bar |
+| Posts | Series cards → numbered parts list; standalones below |
+| Albums | Card grid |
+| Products | Card grid → buy page |
+| Videos | Card grid with inline player modal |
+| Appointments | Inline date strip → slot picker → booking form → Stripe |
+| Infuse | Inline tier cards with benefits → recovery key → Stripe |
+
+### Music Player
+
+The music tab fetches `/music/feed` on first open (lazy). The feed is built from Sanora products with `category: 'music'`. Products with multiple audio artifacts are treated as albums; single-artifact products are standalone tracks.
+
+The player bar is fixed at the bottom of the page and is always dark regardless of `lightMode`. Track titles default to "Track 1", "Track 2", etc. because Sanora stores artifacts by UUID (original filenames are not preserved).
+
+### Posts Hierarchy
+
+Post series are detected server-side by `category: 'post-series'` products. Parts are linked by `series:SeriesTitle` and `part:N` tags. The hierarchy is pre-computed in `generateShoppeHTML` and embedded as `_postsRaw` JSON so the client does no extra fetching.
+
+### Inline Subscriptions and Appointments
+
+Subscriptions and appointments are fully handled inline on the shoppe page — no navigation to separate pages. The full payment flow (recovery key → Stripe Elements → confirmation) runs inside expanding panels under each tier/appointment card. Data (`productId`, `renewalDays`, `benefits`, `timezone`, `duration`) is fetched from Sanora artifact JSON during `getShoppeGoods` and embedded in the page.
+
+## Theming
+
+The shoppe page is **dark mode by default**. All colors use CSS custom properties defined in `:root`:
+
+| Variable | Dark | Light |
+|----------|------|-------|
+| `--bg` | `#0f0f12` | `#f5f5f7` |
+| `--card-bg` | `#18181c` | `white` |
+| `--accent` | `#7ec8e3` | `#0066cc` |
+| `--text` | `#e8e8ea` | `#1d1d1f` |
+| `--border` | `#333` | `#ddd` |
+
+Set `"lightMode": true` in `manifest.json` and re-upload to switch a shoppe to light mode. The flag is stored in `tenants.json` so it persists across re-uploads. The music player bar is always dark in both modes.
+
+## UUID Alias / Redis Reset Recovery
+
+If Sanora's Redis is cleared, the tenant's UUID changes on the next `sanoraEnsureUser` call. The server handles this automatically:
+
+1. The old UUID is kept in `tenants.json` as a forwarding alias: `{ "old-uuid": "new-uuid-string", "new-uuid": { ...fullRecord } }`
+2. `getTenantByIdentifier` follows string values as aliases
+3. All subsequent uploads and page loads use the new UUID transparently
+
+If you encounter `Unknown UUID` errors after a Redis reset, manually add `"old-uuid": "new-uuid"` to `~/.shoppe/tenants.json`.
+
+## Resilience Features
+
+- **`sanoraCreateProductResilient`** — wraps `sanoraCreateProduct`. On 404/not-found mid-upload (Redis cleared), calls `sanoraEnsureUser`, updates `tenant.uuid`, and retries once.
+- **`fetchWithRetry`** — wraps `fetch`. On 429 Too Many Requests, backs off exponentially (1s → 2s → 4s) up to 3 retries.
+- **Image upload isolation** — product image upload failures are caught independently; the product entry is always recorded even if the image fails. A warning is emitted so the user can re-upload to fix just the image.
+
 ## Payment / Transfer Flow
 
 1. Buyer calls `POST /purchase/intent` → shoppe creates a buyer Addie user and calls `PUT /user/:buyerUuid/processor/stripe/intent` on Addie → returns `{ clientSecret, publishableKey }`
 2. Stripe.js confirms payment client-side (no redirect)
 3. Client extracts `paymentIntentId` from `clientSecret` (`clientSecret.split('_secret_')[0]`) and posts to `POST /purchase/complete` with `paymentIntentId`
-4. Server records the order in Sanora, then fires a **fire-and-forget** `POST ${addieUrl}/payment/${paymentIntentId}/process-transfers` — Addie splits the payment and routes it to the tenant's Stripe account (no auth required on this Addie endpoint)
+4. Server records the order in Sanora, then fires a **fire-and-forget** `POST ${addieUrl}/payment/${paymentIntentId}/process-transfers` — Addie splits the payment and routes it to the tenant's Stripe account
 
 **Important:** Transfers only flow to the owner after `node shoppe-sign.js payouts` has been run and Stripe Connect onboarding is complete.
 
@@ -264,6 +337,16 @@ export SHOPPE_BASE_EMOJI="🏪🎪🎁"
 export SANORA_PORT=7243
 ```
 
+## nginx Requirements
+
+The allyabase server's nginx must allow large uploads for books, audio, and images:
+
+```nginx
+client_max_body_size 50M;
+```
+
+Without this, epub/audio artifact uploads and large cover images will fail with 413. Apply to the relevant `server {}` block and reload: `sudo nginx -t && sudo systemctl reload nginx`.
+
 ## Supported File Types
 
 | Category | Extensions |
@@ -276,7 +359,9 @@ export SANORA_PORT=7243
 
 ## Storage
 
-Tenant registry: `.shoppe-tenants.json` (gitignored — contains private keys)
+- `~/.shoppe/tenants.json` — tenant registry (private keys + UUID aliases — gitignored)
+- `~/.shoppe/buyers.json` — buyer Addie keys, keyed by `recoveryKey + productId`
+- `~/.shoppe/config.json` — plugin config (sanoraUrl)
 
 Each tenant's goods are stored in Sanora under their own UUID.
 
@@ -288,6 +373,6 @@ Each tenant's goods are stored in Sanora under their own UUID.
   "form-data": "^4.0.0",
   "multer": "^1.4.5-lts.1",
   "node-fetch": "^2.6.1",
-  "sessionless-node": "^0.9.12"
+  "sessionless-node": "latest"
 }
 ```
