@@ -448,8 +448,13 @@ async function registerTenant(name) {
 
 function getTenantByIdentifier(identifier) {
   const tenants = loadTenants();
-  if (tenants[identifier]) return tenants[identifier];
-  return Object.values(tenants).find(t => t.emojicode === identifier) || null;
+  const entry = tenants[identifier];
+  if (entry) {
+    // String value = alias left behind after a UUID change (Redis reset); follow it.
+    if (typeof entry === 'string') return tenants[entry] || null;
+    return entry;
+  }
+  return Object.values(tenants).find(t => typeof t === 'object' && t.emojicode === identifier) || null;
 }
 
 // ============================================================
@@ -477,6 +482,58 @@ function getMimeType(filename) {
   })[ext] || 'application/octet-stream';
 }
 
+// Ensure the tenant's Sanora user exists (Redis may have been wiped).
+// If the user is found by pubKey but has a different UUID (new registration),
+// updates tenants.json so all subsequent product calls use the correct UUID.
+async function sanoraEnsureUser(tenant) {
+  const { keys } = tenant;
+  const timestamp = Date.now().toString();
+  const message = timestamp + keys.pubKey;
+  sessionless.getKeys = () => keys;
+  const signature = await sessionless.sign(message);
+
+  const resp = await fetch(`${getSanoraUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: keys.pubKey, signature }),
+    timeout: 15000
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Sanora user ensure failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+
+  const sanoraUser = await resp.json();
+  if (sanoraUser.error) throw new Error(`Sanora user ensure: ${sanoraUser.error}`);
+
+  if (sanoraUser.uuid !== tenant.uuid) {
+    console.log(`[shoppe] Sanora UUID changed ${tenant.uuid} → ${sanoraUser.uuid} (Redis was reset). Updating tenants.json.`);
+    const tenants = loadTenants();
+    const oldUuid = tenant.uuid;
+    tenant.uuid = sanoraUser.uuid;
+    tenants[sanoraUser.uuid] = tenant;
+    // Keep old UUID as a forwarding alias so existing manifest.json / shared URLs still resolve.
+    tenants[oldUuid] = sanoraUser.uuid;
+    saveTenants(tenants);
+  }
+
+  return tenant; // tenant.uuid is now correct
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// fetch() wrapper that retries on 429 with exponential backoff (1s, 2s, 4s).
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const resp = await fetch(url, options);
+    if (resp.status !== 429 || attempt === maxRetries) return resp;
+    const delay = 1000 * Math.pow(2, attempt);
+    console.warn(`[shoppe] 429 rate limited on ${new URL(url).pathname}, retrying in ${delay}ms…`);
+    await sleep(delay);
+  }
+}
+
 async function sanoraCreateProduct(tenant, title, category, description, price, shipping, tags) {
   const { uuid, keys } = tenant;
   const timestamp = Date.now().toString();
@@ -486,7 +543,7 @@ async function sanoraCreateProduct(tenant, title, category, description, price, 
   sessionless.getKeys = () => keys;
   const signature = await sessionless.sign(message);
 
-  const resp = await fetch(
+  const resp = await fetchWithRetry(
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}`,
     {
       method: 'PUT',
@@ -505,9 +562,30 @@ async function sanoraCreateProduct(tenant, title, category, description, price, 
     }
   );
 
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Create product failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
   const product = await resp.json();
   if (product.error) throw new Error(`Create product failed: ${product.error}`);
   return product;
+}
+
+// Wrapper used by processArchive. On "not found" (Sanora Redis cleared mid-upload),
+// re-registers the tenant and retries once. tenant.uuid may be updated in place.
+async function sanoraCreateProductResilient(tenant, title, category, description, price, shipping, tags) {
+  try {
+    return await sanoraCreateProduct(tenant, title, category, description, price, shipping, tags);
+  } catch (err) {
+    if (err.message.includes('not found') || err.message.includes('404')) {
+      console.warn(`[shoppe] Sanora user lost mid-upload, re-registering and retrying: ${title}`);
+      const updated = await sanoraEnsureUser(tenant);
+      // Mutate tenant in place so all subsequent calls use the new UUID
+      tenant.uuid = updated.uuid;
+      return await sanoraCreateProduct(tenant, title, category, description, price, shipping, tags);
+    }
+    throw err;
+  }
 }
 
 async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifactType) {
@@ -520,7 +598,7 @@ async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifac
   const form = new FormData();
   form.append('artifact', fileBuffer, { filename, contentType: getMimeType(filename) });
 
-  const resp = await fetch(
+  const resp = await fetchWithRetry(
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}/artifact`,
     {
       method: 'PUT',
@@ -535,6 +613,10 @@ async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifac
     }
   );
 
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Artifact upload failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
   const result = await resp.json();
   if (result.error) throw new Error(`Artifact upload failed: ${result.error}`);
   return result;
@@ -550,7 +632,7 @@ async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
   const form = new FormData();
   form.append('image', imageBuffer, { filename, contentType: getMimeType(filename) });
 
-  const resp = await fetch(
+  const resp = await fetchWithRetry(
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}/image`,
     {
       method: 'PUT',
@@ -564,6 +646,10 @@ async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
     }
   );
 
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Image upload failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
   const result = await resp.json();
   if (result.error) throw new Error(`Image upload failed: ${result.error}`);
   return result;
@@ -672,13 +758,58 @@ async function lucilleUploadVideo(tenant, title, fileBuffer, filename, lucilleUr
 // ARCHIVE PROCESSING
 // ============================================================
 
-async function processArchive(zipPath) {
+// ── Upload job store ─────────────────────────────────────────────────────────
+// Each job buffers SSE events so the client can replay them if it connects late.
+const uploadJobs = new Map(); // jobId → { sse: res|null, queue: [], done: false }
+
+function countItems(root) {
+  let count = 0;
+
+  const booksDir = path.join(root, 'books');
+  if (fs.existsSync(booksDir))
+    count += fs.readdirSync(booksDir).filter(f => fs.statSync(path.join(booksDir, f)).isDirectory()).length;
+
+  const musicDir = path.join(root, 'music');
+  if (fs.existsSync(musicDir)) {
+    for (const entry of fs.readdirSync(musicDir)) {
+      const stat = fs.statSync(path.join(musicDir, entry));
+      if (stat.isDirectory()) count++;
+      else if (MUSIC_EXTS.has(path.extname(entry).toLowerCase())) count++;
+    }
+  }
+
+  const postsDir = path.join(root, 'posts');
+  if (fs.existsSync(postsDir)) {
+    for (const entry of fs.readdirSync(postsDir)) {
+      const entryPath = path.join(postsDir, entry);
+      if (!fs.statSync(entryPath).isDirectory()) continue;
+      const subDirs = fs.readdirSync(entryPath).filter(f => fs.statSync(path.join(entryPath, f)).isDirectory());
+      count += subDirs.length > 0 ? 1 + subDirs.length : 1;
+    }
+  }
+
+  for (const dirName of ['albums', 'products', 'subscriptions', 'videos', 'appointments']) {
+    const dir = path.join(root, dirName);
+    if (fs.existsSync(dir))
+      count += fs.readdirSync(dir).filter(f => fs.statSync(path.join(dir, f)).isDirectory()).length;
+  }
+
+  return count;
+}
+
+async function processArchive(zipPath, onProgress = () => {}) {
   const tmpDir = path.join(TMP_DIR, `extract-${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
   // Use system unzip to stream-extract without loading entire archive into RAM.
   // AdmZip loads the whole zip into memory upfront, which OOM-kills Node on large archives.
   try {
-    execSync(`unzip -o "${zipPath}" -d "${tmpDir}"`, { stdio: 'pipe' });
+    const unzipBin = (() => {
+      for (const p of ['/usr/bin/unzip', '/bin/unzip', '/usr/local/bin/unzip']) {
+        if (fs.existsSync(p)) return p;
+      }
+      return 'unzip'; // fallback, let it fail with a clear error
+    })();
+    execSync(`"${unzipBin}" -o "${zipPath}" -d "${tmpDir}"`, { stdio: 'pipe' });
   } catch (err) {
     throw new Error(`Failed to extract archive: ${err.stderr ? err.stderr.toString().trim() : err.message}`);
   }
@@ -711,7 +842,7 @@ async function processArchive(zipPath) {
       throw new Error('manifest.json must contain uuid and emojicode');
     }
 
-    const tenant = getTenantByIdentifier(manifest.uuid);
+    let tenant = getTenantByIdentifier(manifest.uuid);
     if (!tenant) throw new Error(`Unknown UUID: ${manifest.uuid}`);
     if (tenant.emojicode !== manifest.emojicode) {
       throw new Error('emojicode does not match registered tenant');
@@ -728,12 +859,23 @@ async function processArchive(zipPath) {
     if (manifest.redirects && typeof manifest.redirects === 'object') {
       tenantUpdates.redirects = manifest.redirects;
     }
+    if (manifest.lightMode !== undefined) {
+      tenantUpdates.lightMode = !!manifest.lightMode;
+    }
     if (Object.keys(tenantUpdates).length > 0) {
       const tenants = loadTenants();
       Object.assign(tenants[tenant.uuid], tenantUpdates);
       saveTenants(tenants);
       Object.assign(tenant, tenantUpdates);
     }
+
+    // Ensure the Sanora user exists before uploading any products.
+    // If Redis was wiped, this re-creates the user and updates tenant.uuid.
+    tenant = await sanoraEnsureUser(tenant);
+
+    const total = countItems(root);
+    let current = 0;
+    onProgress({ type: 'start', total, name: manifest.name });
 
     const results = { books: [], music: [], posts: [], albums: [], products: [], videos: [], appointments: [], subscriptions: [], warnings: [] };
 
@@ -763,7 +905,8 @@ async function processArchive(zipPath) {
           const description = info.description || '';
           const price = info.price || 0;
 
-          await sanoraCreateProduct(tenant, title, 'book', description, price, 0, buildTags('book', info.keywords));
+          onProgress({ type: 'progress', current: ++current, total, label: `📚 ${title}` });
+          await sanoraCreateProductResilient(tenant, title, 'book', description, price, 0, buildTags('book', info.keywords));
 
           // Cover image — use info.cover to pin a specific file, else first image found
           const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -805,7 +948,8 @@ async function processArchive(zipPath) {
           try {
             const description = info.description || `Album: ${albumTitle}`;
             const price = info.price || 0;
-            await sanoraCreateProduct(tenant, albumTitle, 'music', description, price, 0, buildTags('music,album', info.keywords));
+            onProgress({ type: 'progress', current: ++current, total, label: `🎵 ${albumTitle}` });
+            await sanoraCreateProductResilient(tenant, albumTitle, 'music', description, price, 0, buildTags('music,album', info.keywords));
             const coverFile = info.cover ? (covers.find(f => f === info.cover) || covers[0]) : covers[0];
             if (coverFile) {
               const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
@@ -834,7 +978,8 @@ async function processArchive(zipPath) {
             const buf = fs.readFileSync(entryPath);
             const description = trackInfo.description || `Track: ${title}`;
             const price = trackInfo.price || 0;
-            await sanoraCreateProduct(tenant, title, 'music', description, price, 0, buildTags('music,track', trackInfo.keywords));
+            onProgress({ type: 'progress', current: ++current, total, label: `🎵 ${title}` });
+            await sanoraCreateProductResilient(tenant, title, 'music', description, price, 0, buildTags('music,track', trackInfo.keywords));
             await sanoraUploadArtifact(tenant, title, buf, entry, 'audio');
             results.music.push({ title, type: 'track' });
             console.log(`[shoppe]   🎵 track: ${title}`);
@@ -874,7 +1019,8 @@ async function processArchive(zipPath) {
           // Register the series itself as a parent product
           try {
             const description = info.description || `A ${subDirs.length}-part series`;
-            await sanoraCreateProduct(tenant, seriesTitle, 'post-series', description, 0, 0, buildTags(`post,series,order:${order}`, info.keywords));
+            onProgress({ type: 'progress', current: ++current, total, label: `📝 ${seriesTitle} (series)` });
+            await sanoraCreateProductResilient(tenant, seriesTitle, 'post-series', description, 0, 0, buildTags(`post,series,order:${order}`, info.keywords));
 
             const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
             if (covers.length > 0) {
@@ -914,7 +1060,8 @@ async function processArchive(zipPath) {
               const productTitle = `${seriesTitle}: ${resolvedTitle}`;
               const description = partInfo.description || partFm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || resolvedTitle;
 
-              await sanoraCreateProduct(tenant, productTitle, 'post', description, 0, 0,
+              onProgress({ type: 'progress', current: ++current, total, label: `📝 ${productTitle}` });
+              await sanoraCreateProductResilient(tenant, productTitle, 'post', description, 0, 0,
                 buildTags(`post,blog,series:${seriesTitle},part:${partIndex + 1},order:${order}`, partInfo.keywords));
 
               await sanoraUploadArtifact(tenant, productTitle, mdBuf, partMdFiles[0], 'text');
@@ -956,7 +1103,8 @@ async function processArchive(zipPath) {
             const firstLine = fm.body.split('\n').find(l => l.trim()).replace(/^#+\s*/, '');
             const description = info.description || fm.body.split('\n\n')[0].replace(/^#+\s*/, '').trim() || firstLine || title;
 
-            await sanoraCreateProduct(tenant, title, 'post', description, 0, 0, buildTags(`post,blog,order:${order}`, info.keywords));
+            onProgress({ type: 'progress', current: ++current, total, label: `📝 ${title}` });
+            await sanoraCreateProductResilient(tenant, title, 'post', description, 0, 0, buildTags(`post,blog,order:${order}`, info.keywords));
             await sanoraUploadArtifact(tenant, title, mdBuf, mdFiles[0], 'text');
 
             const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -993,7 +1141,8 @@ async function processArchive(zipPath) {
         if (!fs.statSync(entryPath).isDirectory()) continue;
         const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
         try {
-          await sanoraCreateProduct(tenant, entry, 'album', `Photo album: ${entry}`, 0, 0, 'album,photos');
+          onProgress({ type: 'progress', current: ++current, total, label: `🖼️ ${entry}` });
+          await sanoraCreateProductResilient(tenant, entry, 'album', `Photo album: ${entry}`, 0, 0, 'album,photos');
           if (images.length > 0) {
             const coverBuf = fs.readFileSync(path.join(entryPath, images[0]));
             await sanoraUploadImage(tenant, entry, coverBuf, images[0]);
@@ -1030,7 +1179,8 @@ async function processArchive(zipPath) {
           const price = info.price || 0;
           const shipping = info.shipping || 0;
 
-          await sanoraCreateProduct(tenant, title, 'product', description, price, shipping, buildTags(`product,physical,order:${order}`, info.keywords));
+          onProgress({ type: 'progress', current: ++current, total, label: `📦 ${title}` });
+          await sanoraCreateProductResilient(tenant, title, 'product', description, price, shipping, buildTags(`product,physical,order:${order}`, info.keywords));
 
           // Hero image: prefer hero.jpg / hero.png, fall back to first image
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -1071,7 +1221,8 @@ async function processArchive(zipPath) {
             renewalDays: info.renewalDays || 30
           };
 
-          await sanoraCreateProduct(tenant, title, 'subscription', description, price, 0, buildTags('subscription', info.keywords));
+          onProgress({ type: 'progress', current: ++current, total, label: `🎁 ${title}` });
+          await sanoraCreateProductResilient(tenant, title, 'subscription', description, price, 0, buildTags('subscription', info.keywords));
 
           // Upload tier metadata (benefits list, renewal period) as a JSON artifact
           const tierBuf = Buffer.from(JSON.stringify(tierMeta));
@@ -1146,7 +1297,8 @@ async function processArchive(zipPath) {
             (lucilleVideoId ? `,lucille-id:${lucilleVideoId},lucille-url:${lucilleBase}` : '');
 
           // Sanora catalog entry (for discovery / storefront)
-          await sanoraCreateProduct(tenant, title, 'video', description, price, 0, videoTags);
+          onProgress({ type: 'progress', current: ++current, total, label: `🎬 ${title}` });
+          await sanoraCreateProductResilient(tenant, title, 'video', description, price, 0, videoTags);
 
           // Cover / poster image (optional)
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
@@ -1192,7 +1344,8 @@ async function processArchive(zipPath) {
             advanceDays:  info.advanceDays  || 30
           };
 
-          await sanoraCreateProduct(tenant, title, 'appointment', description, price, 0, buildTags('appointment', info.keywords));
+          onProgress({ type: 'progress', current: ++current, total, label: `📅 ${title}` });
+          await sanoraCreateProductResilient(tenant, title, 'appointment', description, price, 0, buildTags('appointment', info.keywords));
 
           // Upload schedule as a JSON artifact so the booking page can retrieve it
           const scheduleBuf = Buffer.from(JSON.stringify(schedule));
@@ -1283,12 +1436,37 @@ async function getShoppeGoods(tenant) {
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
       url: (bucketName && redirects[bucketName]) || defaultUrl,
+      ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
       ...(product.category === 'video' && { shoppeId: tenant.uuid })
     };
     const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
   }
+
+  // Enrich subscription and appointment items with artifact metadata
+  const productsByTitle = {};
+  for (const [key, product] of Object.entries(products)) {
+    productsByTitle[product.title || key] = product;
+  }
+  await Promise.all([
+    ...goods.subscriptions.map(async item => {
+      const product = productsByTitle[item.title];
+      if (!product) return;
+      item.productId   = product.productId || '';
+      const tierInfo   = await getTierInfo(tenant, product).catch(() => null);
+      item.renewalDays = tierInfo ? (tierInfo.renewalDays || 30) : 30;
+      item.benefits    = tierInfo ? (tierInfo.benefits    || []) : [];
+    }),
+    ...goods.appointments.map(async item => {
+      const product = productsByTitle[item.title];
+      if (!product) return;
+      item.productId = product.productId || '';
+      const schedule  = await getAppointmentSchedule(tenant, product).catch(() => null);
+      item.timezone   = schedule ? (schedule.timezone || 'UTC') : 'UTC';
+      item.duration   = schedule ? (schedule.duration  || 60)  : 60;
+    })
+  ]);
 
   return goods;
 }
@@ -1636,32 +1814,86 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${tenant.name}</title>
   ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
+  <script src="https://js.stripe.com/v3/"></script>
   <style>
+    /* ── Theme variables (dark default) ── */
+    :root {
+      --bg:           #0f0f12;
+      --card-bg:      #18181c;
+      --card-bg-2:    #1e1e22;
+      --input-bg:     #2a2a2e;
+      --nav-bg:       #18181c;
+      --text:         #e8e8ea;
+      --text-2:       #aaa;
+      --text-3:       #888;
+      --accent:       #7ec8e3;
+      --border:       #333;
+      --hover-bg:     #1a3040;
+      --badge-bg:     #1a3040;
+      --placeholder:  #2a2a2e;
+      --shadow:       rgba(0,0,0,0.4);
+      --shadow-hover: rgba(0,0,0,0.65);
+      --row-border:   #2a2a2e;
+      --progress-bg:  #333;
+      --chip-bg:      #2a2a2e;
+      --note-bg:      #2a2600;
+      --note-border:  #665500;
+      --note-text:    #ccaa44;
+      --ok-bg:        #0a2a18;
+      --ok-border:    #2a7050;
+      --ok-text:      #5dd49a;
+    }
+    body.light {
+      --bg:           #f5f5f7;
+      --card-bg:      white;
+      --card-bg-2:    #fafafa;
+      --input-bg:     white;
+      --nav-bg:       white;
+      --text:         #1d1d1f;
+      --text-2:       #666;
+      --text-3:       #888;
+      --accent:       #0066cc;
+      --border:       #ddd;
+      --hover-bg:     #e8f0fe;
+      --badge-bg:     #e8f0fe;
+      --placeholder:  #f0f0f7;
+      --shadow:       rgba(0,0,0,0.07);
+      --shadow-hover: rgba(0,0,0,0.12);
+      --row-border:   #f0f0f0;
+      --progress-bg:  #e0e0e0;
+      --chip-bg:      #f0f0f7;
+      --note-bg:      #fffde7;
+      --note-border:  #e0c040;
+      --note-text:    #7a6000;
+      --ok-bg:        #f0faf4;
+      --ok-border:    #48bb78;
+      --ok-text:      #276749;
+    }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f7; color: #1d1d1f; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
     header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); color: white; padding: 48px 24px 40px; text-align: center; }
     .emojicode { font-size: 30px; letter-spacing: 6px; margin-bottom: 14px; }
     header h1 { font-size: 38px; font-weight: 700; margin-bottom: 6px; }
     .count { opacity: 0.65; font-size: 15px; }
-    nav { display: flex; overflow-x: auto; background: white; border-bottom: 1px solid #ddd; padding: 0 20px; gap: 0; }
-    .tab { padding: 14px 18px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; border-bottom: 2px solid transparent; color: #555; transition: color 0.15s, border-color 0.15s; }
-    .tab:hover { color: #0066cc; }
-    .tab.active { color: #0066cc; border-bottom-color: #0066cc; }
-    .badge { background: #e8f0fe; color: #0066cc; border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 5px; }
+    nav { display: flex; overflow-x: auto; background: var(--nav-bg); border-bottom: 1px solid var(--border); padding: 0 20px; gap: 0; }
+    .tab { padding: 14px 18px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; border-bottom: 2px solid transparent; color: var(--text-2); transition: color 0.15s, border-color 0.15s; }
+    .tab:hover { color: var(--accent); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .badge { background: var(--badge-bg); color: var(--accent); border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 5px; }
     main { max-width: 1200px; margin: 0 auto; padding: 36px 24px; }
     .section { display: none; }
     .section.active { display: block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 20px; }
-    .card { background: white; border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.07); cursor: pointer; transition: transform 0.18s, box-shadow 0.18s; }
-    .card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+    .card { background: var(--card-bg); border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px var(--shadow); cursor: pointer; transition: transform 0.18s, box-shadow 0.18s; }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px var(--shadow-hover); }
     .card-img img { width: 100%; height: 190px; object-fit: cover; display: block; }
-    .card-img-placeholder { height: 110px; display: flex; align-items: center; justify-content: center; font-size: 44px; background: #f0f0f7; }
+    .card-img-placeholder { height: 110px; display: flex; align-items: center; justify-content: center; font-size: 44px; background: var(--placeholder); }
     .card-body { padding: 16px; }
     .card-title { font-size: 15px; font-weight: 600; margin-bottom: 5px; line-height: 1.3; }
-    .card-desc { font-size: 13px; color: #666; margin-bottom: 8px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-    .price { font-size: 15px; font-weight: 700; color: #0066cc; }
-    .shipping { font-size: 12px; font-weight: 400; color: #888; }
-    .empty { color: #999; text-align: center; padding: 60px 0; font-size: 15px; }
+    .card-desc { font-size: 13px; color: var(--text-2); margin-bottom: 8px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+    .price { font-size: 15px; font-weight: 700; color: var(--accent); }
+    .shipping { font-size: 12px; font-weight: 400; color: var(--text-3); }
+    .empty { color: var(--text-3); text-align: center; padding: 60px 0; font-size: 15px; }
     .card-video-play { position: relative; }
     .card-video-play::after { content: '▶'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 36px; color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.35); opacity: 0; transition: opacity 0.2s; pointer-events: none; }
     .card:hover .card-video-play::after { opacity: 1; }
@@ -1673,14 +1905,131 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
     .video-modal-close { position: absolute; top: 10px; right: 12px; z-index: 2; background: rgba(0,0,0,0.5); border: none; color: #fff; font-size: 20px; line-height: 1; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
     .video-modal-close:hover { background: rgba(0,0,0,0.8); }
     .card-video-upload { cursor: default !important; }
-    .upload-btn-label { display: inline-block; background: #0066cc; color: white; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 8px; }
-    .upload-btn-label:hover { background: #0052a3; }
-    .upload-progress { margin-top: 8px; font-size: 12px; color: #555; }
-    .upload-progress-bar { height: 4px; background: #e0e0e0; border-radius: 2px; margin-top: 4px; overflow: hidden; }
-    .upload-progress-bar-fill { height: 100%; background: #0066cc; border-radius: 2px; transition: width 0.2s; }
+    .upload-btn-label { display: inline-block; background: var(--accent); color: white; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+    .upload-btn-label:hover { opacity: 0.85; }
+    .upload-progress { margin-top: 8px; font-size: 12px; color: var(--text-2); }
+    .upload-progress-bar { height: 4px; background: var(--progress-bg); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+    .upload-progress-bar-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.2s; }
+    /* ── Posts browser ── */
+    .posts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 20px; }
+    .posts-back-btn { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; margin-bottom: 20px; color: var(--text); }
+    .posts-back-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .posts-series-header { display: flex; gap: 20px; align-items: flex-start; margin-bottom: 24px; }
+    .posts-series-cover { width: 120px; height: 120px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
+    .posts-series-title { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
+    .posts-series-desc { font-size: 14px; color: var(--text-2); line-height: 1.5; }
+    .posts-part-row { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 10px; cursor: pointer; transition: background 0.15s; border-bottom: 1px solid var(--row-border); text-decoration: none; color: inherit; }
+    .posts-part-row:hover { background: var(--hover-bg); }
+    .posts-part-num { font-size: 13px; color: var(--text-3); min-width: 28px; text-align: center; font-weight: 600; }
+    .posts-part-info { flex: 1; min-width: 0; }
+    .posts-part-title { font-size: 15px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .posts-part-desc { font-size: 12px; color: var(--text-3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .posts-part-arrow { color: var(--accent); font-size: 14px; }
+    .posts-standalones-label { font-size: 12px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .5px; margin: 28px 0 12px; }
+    /* ── Music player ── */
+    .music-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; }
+    .music-album-card { cursor: pointer; }
+    .music-back-btn { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; margin-bottom: 20px; color: var(--text); }
+    .music-back-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .music-detail-header { display: flex; gap: 20px; align-items: flex-start; margin-bottom: 24px; }
+    .music-detail-cover { width: 140px; height: 140px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
+    .music-detail-title { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
+    .music-detail-desc { font-size: 14px; color: var(--text-2); line-height: 1.5; }
+    .music-track-row { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: 10px; cursor: pointer; transition: background 0.15s; }
+    .music-track-row:hover, .music-track-row.playing { background: var(--hover-bg); }
+    .music-track-row.playing .music-track-title { color: var(--accent); font-weight: 600; }
+    .music-track-num { font-size: 14px; color: var(--text-3); min-width: 24px; text-align: center; }
+    .music-track-cover { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+    .music-track-cover-ph { width: 40px; height: 40px; border-radius: 6px; background: var(--placeholder); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+    .music-track-info { flex: 1; min-width: 0; }
+    .music-track-title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .music-track-meta { font-size: 12px; color: var(--text-3); }
+    .music-play-icon { font-size: 14px; color: var(--text-3); opacity: 0; transition: opacity 0.15s; }
+    .music-track-row:hover .music-play-icon { opacity: 1; }
+    .music-track-row.playing .music-play-icon { opacity: 1; color: var(--accent); }
+    .music-singles-label { font-size: 12px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .5px; margin: 28px 0 8px; }
+    /* ── Music player bar (always dark) ── */
+    #music-player-bar { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(15,15,30,0.97); backdrop-filter: blur(12px); border-top: 1px solid #8b5cf6; padding: 12px 20px; z-index: 500; display: none; }
+    .music-bar-inner { max-width: 1200px; margin: 0 auto; display: flex; align-items: center; gap: 16px; }
+    .music-bar-art { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+    .music-bar-info { flex: 1; min-width: 0; }
+    .music-bar-title { font-size: 14px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .music-bar-album { font-size: 12px; color: #8b5cf6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .music-bar-controls { display: flex; align-items: center; gap: 10px; }
+    .music-bar-btn { background: none; border: none; cursor: pointer; color: #10b981; font-size: 20px; padding: 4px 8px; line-height: 1; transition: color 0.15s; }
+    .music-bar-btn:hover { color: #fff; }
+    .music-bar-progress { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 120px; }
+    .music-bar-time { font-size: 11px; color: #fbbf24; min-width: 36px; text-align: center; }
+    .music-bar-track { flex: 1; height: 4px; background: rgba(139,92,246,0.3); border-radius: 2px; cursor: pointer; position: relative; }
+    .music-bar-fill { height: 100%; background: linear-gradient(90deg, #10b981, #8b5cf6); border-radius: 2px; width: 0%; transition: width 0.1s linear; }
+    /* ── Inline subscription tiers ── */
+    .sub-tier-card { background: var(--card-bg); border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px var(--shadow); margin-bottom: 20px; }
+    .sub-tier-header { display: flex; gap: 20px; padding: 20px; }
+    .sub-tier-img { width: 110px; height: 110px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
+    .sub-tier-img-ph { width: 110px; height: 110px; border-radius: 10px; background: linear-gradient(135deg, #1a1a2e, #0f3460); display: flex; align-items: center; justify-content: center; font-size: 36px; flex-shrink: 0; }
+    .sub-tier-info { flex: 1; min-width: 0; }
+    .sub-tier-name { font-size: 19px; font-weight: 700; margin-bottom: 5px; }
+    .sub-tier-desc { font-size: 13px; color: var(--text-2); line-height: 1.5; margin-bottom: 10px; }
+    .sub-tier-price { display: inline-flex; align-items: baseline; gap: 5px; color: var(--accent); font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+    .sub-tier-price span { font-size: 12px; color: var(--text-3); font-weight: 400; }
+    .sub-benefits { list-style: none; display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+    .sub-benefits li { font-size: 12px; color: var(--text-2); padding-left: 16px; position: relative; }
+    .sub-benefits li::before { content: '✓'; position: absolute; left: 0; color: var(--accent); font-weight: 700; }
+    .sub-btn { background: linear-gradient(90deg, #0f3460, var(--accent)); color: white; border: none; border-radius: 8px; padding: 9px 20px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    .sub-btn:hover { opacity: 0.88; }
+    .sub-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .sub-form-panel { display: none; padding: 24px; border-top: 1px solid var(--border); background: var(--card-bg-2); }
+    .sub-form-panel.open { display: block; }
+    .sub-field-group { margin-bottom: 14px; }
+    .sub-field-group label { display: block; font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+    .sub-field-group input { width: 100%; max-width: 400px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-size: 14px; outline: none; transition: border-color 0.15s; }
+    .sub-field-group input:focus { border-color: var(--accent); }
+    .sub-error { color: #ff6b6b; font-size: 13px; margin-top: 8px; display: none; }
+    .sub-recovery-note { background: var(--note-bg); border: 1px solid var(--note-border); border-radius: 8px; padding: 10px 14px; font-size: 12px; color: var(--note-text); margin-bottom: 14px; line-height: 1.5; }
+    .sub-already { background: var(--ok-bg); border: 1px solid var(--ok-border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+    .sub-already strong { color: var(--ok-text); font-size: 14px; display: block; margin-bottom: 4px; }
+    .sub-already p { font-size: 13px; color: var(--text-2); }
+    .sub-confirm-box { text-align: center; padding: 24px; }
+    .sub-confirm-box .icon { font-size: 48px; margin-bottom: 10px; }
+    .sub-confirm-box h3 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    .sub-confirm-box .renews { color: var(--accent); font-size: 14px; margin-bottom: 8px; }
+    /* ── Inline appointment booking ── */
+    .appt-card { background: var(--card-bg); border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px var(--shadow); margin-bottom: 20px; }
+    .appt-card-header { display: flex; gap: 20px; padding: 20px; cursor: pointer; }
+    .appt-card-header:hover { background: var(--card-bg-2); }
+    .appt-img { width: 110px; height: 110px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
+    .appt-img-ph { width: 110px; height: 110px; border-radius: 10px; background: linear-gradient(135deg, #1a1a2e, #0f3460); display: flex; align-items: center; justify-content: center; font-size: 36px; flex-shrink: 0; }
+    .appt-info { flex: 1; min-width: 0; }
+    .appt-name { font-size: 19px; font-weight: 700; margin-bottom: 5px; }
+    .appt-desc { font-size: 13px; color: var(--text-2); line-height: 1.5; margin-bottom: 10px; }
+    .appt-meta { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .appt-chip { background: var(--chip-bg); border-radius: 20px; padding: 4px 12px; font-size: 12px; color: var(--text-2); }
+    .appt-book-btn { background: linear-gradient(90deg, #0f3460, var(--accent)); color: white; border: none; border-radius: 8px; padding: 9px 20px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    .appt-book-btn:hover { opacity: 0.88; }
+    .appt-book-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .appt-booking-panel { display: none; padding: 24px; border-top: 1px solid var(--border); background: var(--card-bg-2); }
+    .appt-booking-panel.open { display: block; }
+    .appt-date-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 16px; scrollbar-width: thin; }
+    .appt-date-card { flex: 0 0 66px; background: var(--input-bg); border: 2px solid var(--border); border-radius: 10px; padding: 8px 4px; text-align: center; cursor: pointer; transition: border-color 0.15s; }
+    .appt-date-card:hover { border-color: var(--accent); }
+    .appt-date-card.active { border-color: var(--accent); background: var(--hover-bg); }
+    .appt-date-card .dow { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.5px; }
+    .appt-date-card .dom { font-size: 20px; font-weight: 700; margin: 1px 0; color: var(--text); }
+    .appt-date-card .mon { font-size: 10px; color: var(--text-3); }
+    .appt-slot-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .appt-slot-btn { background: var(--input-bg); border: 2px solid var(--border); border-radius: 8px; padding: 6px 14px; font-size: 13px; color: var(--text); cursor: pointer; transition: border-color 0.15s; }
+    .appt-slot-btn:hover { border-color: var(--accent); }
+    .appt-slot-btn.active { border-color: var(--accent); background: var(--hover-bg); color: var(--accent); font-weight: 600; }
+    .appt-selected-slot { background: var(--hover-bg); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--accent); margin-bottom: 14px; }
+    .appt-back-btn { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 9px 16px; font-size: 13px; cursor: pointer; color: var(--text-2); }
+    .appt-back-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .appt-confirm-box { text-align: center; padding: 24px; }
+    .appt-confirm-box .icon { font-size: 48px; margin-bottom: 10px; }
+    .appt-confirm-box h3 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    .appt-confirm-box .slot-label { color: var(--accent); font-size: 15px; font-weight: 600; margin-bottom: 8px; }
   </style>
 </head>
-<body>
+<body${tenant.lightMode ? ' class="light"' : ''}>
   <header>
     <div class="emojicode">${tenant.emojicode}</div>
     <h1>${tenant.name}</h1>
@@ -1690,17 +2039,56 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   <main>
     <div id="all" class="section active"><div class="grid">${renderCards(allItems, 'all')}</div></div>
     <div id="books" class="section"><div class="grid">${renderCards(goods.books, 'book')}</div></div>
-    <div id="music" class="section"><div class="grid">${renderCards(goods.music, 'music')}</div></div>
-    <div id="posts" class="section"><div class="grid">${renderCards(goods.posts, 'post')}</div></div>
+    <div id="music" class="section">
+      <div id="music-album-grid"></div>
+      <div id="music-album-detail" style="display:none">
+        <button class="music-back-btn" onclick="musicShowGrid()">&#8592; Albums</button>
+        <div id="music-detail-header"></div>
+        <div id="music-track-list"></div>
+      </div>
+    </div>
+    <div id="posts" class="section">
+      <div id="posts-grid"></div>
+      <div id="posts-series-detail" style="display:none">
+        <button class="posts-back-btn" onclick="postsShowGrid()">&#8592; Posts</button>
+        <div id="posts-series-header"></div>
+        <div id="posts-parts-list"></div>
+      </div>
+    </div>
     <div id="albums" class="section"><div class="grid">${renderCards(goods.albums, 'album')}</div></div>
     <div id="products" class="section"><div class="grid">${renderCards(goods.products, 'product')}</div></div>
     <div id="videos" class="section"><div class="grid">${renderCards(goods.videos, 'video')}</div></div>
-    <div id="appointments" class="section"><div class="grid">${renderCards(goods.appointments, 'appointment')}</div></div>
-    <div id="subscriptions" class="section"><div class="grid">${renderCards(goods.subscriptions, 'subscription')}</div></div>
-    <div style="text-align:center;padding:24px 0 8px;font-size:14px;color:#888;">
-      Already infusing? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+    <div id="appointments" class="section">
+      <div id="appointments-list"></div>
+    </div>
+    <div id="subscriptions" class="section">
+      <div id="subscriptions-list"></div>
+      <div style="text-align:center;padding:12px 0 8px;font-size:13px;color:#888;">
+        Already infusing? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+      </div>
     </div>
   </main>
+  <div id="music-player-bar">
+    <div class="music-bar-inner">
+      <img id="music-bar-art" class="music-bar-art" src="" alt="" style="display:none">
+      <div class="music-bar-info">
+        <div class="music-bar-title" id="music-bar-title">—</div>
+        <div class="music-bar-album" id="music-bar-album"></div>
+      </div>
+      <div class="music-bar-controls">
+        <button class="music-bar-btn" onclick="musicBarPrev()" title="Previous">&#9664;&#9664;</button>
+        <button class="music-bar-btn" id="music-bar-play" onclick="musicBarPlayPause()" title="Play/Pause">&#9654;</button>
+        <button class="music-bar-btn" onclick="musicBarNext()" title="Next">&#9654;&#9654;</button>
+      </div>
+      <div class="music-bar-progress">
+        <span class="music-bar-time" id="music-bar-time">0:00</span>
+        <div class="music-bar-track" onclick="musicBarSeek(event)">
+          <div class="music-bar-fill" id="music-bar-fill"></div>
+        </div>
+        <span class="music-bar-time" id="music-bar-dur">0:00</span>
+      </div>
+    </div>
+  </div>
   <div id="video-modal" class="video-modal">
     <div class="video-modal-backdrop" onclick="closeVideo()"></div>
     <div class="video-modal-content">
@@ -1715,6 +2103,248 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.getElementById(id).classList.add('active');
       tab.classList.add('active');
+      if (id === 'music' && !_musicLoaded) initMusic();
+      if (id === 'posts' && !_postsLoaded) initPosts();
+      if (id === 'subscriptions' && !_subsLoaded) initSubscriptions();
+      if (id === 'appointments' && !_apptsLoaded) initAppointments();
+    }
+
+    // ── Posts browser ───────────────────────────────────────────────────────
+    const _postsRaw = ${(() => {
+      // Build structured posts data server-side so the client just reads JSON.
+      const seriesMap = {};  // seriesTitle → { item, parts: [] }
+      const standalones = [];
+      // First pass: collect series parents
+      for (const item of goods.posts) {
+        if (item.category === 'post-series') seriesMap[item.title] = { ...item, parts: [] };
+      }
+      // Second pass: attach parts to their series, or collect standalones
+      for (const item of goods.posts) {
+        if (item.category !== 'post') continue;
+        const tagParts = (item.tags || '').split(',');
+        const seriesTag = tagParts.find(t => t.startsWith('series:'));
+        const partTag   = tagParts.find(t => t.startsWith('part:'));
+        const seriesTitle = seriesTag ? seriesTag.slice('series:'.length) : null;
+        const partNum     = partTag   ? parseInt(partTag.slice('part:'.length)) || 0 : 0;
+        if (seriesTitle && seriesMap[seriesTitle]) {
+          seriesMap[seriesTitle].parts.push({ ...item, partNum });
+        } else {
+          standalones.push(item);
+        }
+      }
+      // Sort parts within each series
+      for (const s of Object.values(seriesMap)) {
+        s.parts.sort((a, b) => (a.partNum || 0) - (b.partNum || 0));
+      }
+      return JSON.stringify({ series: Object.values(seriesMap), standalones });
+    })()};
+    let _postsLoaded = false;
+
+    function initPosts() {
+      _postsLoaded = true;
+      postsRenderGrid();
+    }
+
+    function postsRenderGrid() {
+      const grid = document.getElementById('posts-grid');
+      const { series, standalones } = _postsRaw;
+      if (series.length === 0 && standalones.length === 0) {
+        grid.innerHTML = '<p class="empty">No posts yet.</p>';
+        return;
+      }
+      const seriesHtml = series.length ? \`<div class="posts-grid">\${series.map((s, i) => \`
+        <div class="card" style="cursor:pointer" onclick="postsShowSeries(\${i})">
+          \${s.image ? \`<div class="card-img"><img src="\${_escHtml(s.image)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">📝</div>'}
+          <div class="card-body">
+            <div class="card-title">\${_escHtml(s.title)}</div>
+            \${s.description ? \`<div class="card-desc">\${_escHtml(s.description)}</div>\` : ''}
+            <div style="font-size:12px;color:#0066cc;margin-top:6px;font-weight:600">\${s.parts.length} part\${s.parts.length !== 1 ? 's' : ''}</div>
+          </div>
+        </div>\`).join('')}</div>\` : '';
+      const standaloneHtml = standalones.length ? \`
+        \${series.length ? '<div class="posts-standalones-label">Posts</div>' : ''}
+        <div class="posts-grid">\${standalones.map(p => \`
+          <div class="card" onclick="window.open('\${_escHtml(p.url)}','_self')">
+            \${p.image ? \`<div class="card-img"><img src="\${_escHtml(p.image)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">📝</div>'}
+            <div class="card-body">
+              <div class="card-title">\${_escHtml(p.title)}</div>
+              \${p.description ? \`<div class="card-desc">\${_escHtml(p.description)}</div>\` : ''}
+            </div>
+          </div>\`).join('')}</div>\` : '';
+      grid.innerHTML = seriesHtml + standaloneHtml;
+    }
+
+    function postsShowSeries(idx) {
+      const s = _postsRaw.series[idx];
+      document.getElementById('posts-grid').style.display = 'none';
+      document.getElementById('posts-series-detail').style.display = 'block';
+      document.getElementById('posts-series-header').innerHTML = \`
+        <div class="posts-series-header">
+          \${s.image ? \`<img class="posts-series-cover" src="\${_escHtml(s.image)}" alt="">\` : ''}
+          <div>
+            <div class="posts-series-title">\${_escHtml(s.title)}</div>
+            \${s.description ? \`<div class="posts-series-desc">\${_escHtml(s.description)}</div>\` : ''}
+          </div>
+        </div>\`;
+      document.getElementById('posts-parts-list').innerHTML = s.parts.map((p, i) => \`
+        <a class="posts-part-row" href="\${_escHtml(p.url)}">
+          <div class="posts-part-num">\${p.partNum || i + 1}</div>
+          <div class="posts-part-info">
+            <div class="posts-part-title">\${_escHtml(p.title.replace(s.title + ': ', ''))}</div>
+            \${p.description ? \`<div class="posts-part-desc">\${_escHtml(p.description)}</div>\` : ''}
+          </div>
+          <div class="posts-part-arrow">&#8594;</div>
+        </a>\`).join('');
+    }
+
+    function postsShowGrid() {
+      document.getElementById('posts-grid').style.display = '';
+      document.getElementById('posts-series-detail').style.display = 'none';
+    }
+
+    // ── Music player ────────────────────────────────────────────────────────
+    let _musicLoaded = false, _musicAlbums = [], _musicTracks = [], _musicAllTracks = [], _musicCurrentIdx = -1;
+    const _musicAudio = new Audio();
+
+    function _escHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function initMusic() {
+      _musicLoaded = true;
+      const grid = document.getElementById('music-album-grid');
+      grid.innerHTML = '<p class="empty">Loading music\u2026</p>';
+      try {
+        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/music/feed');
+        const data = await resp.json();
+        _musicAlbums = data.albums || [];
+        _musicTracks = data.tracks || [];
+        _musicAllTracks = [
+          ..._musicAlbums.flatMap(a => a.tracks.map(t => ({ ...t, cover: a.cover, albumName: a.name }))),
+          ..._musicTracks.map(t => ({ ...t, albumName: '' }))
+        ];
+        musicRenderGrid();
+      } catch (e) {
+        grid.innerHTML = '<p class="empty">Could not load music.</p>';
+      }
+    }
+
+    function musicRenderGrid() {
+      const grid = document.getElementById('music-album-grid');
+      if (_musicAlbums.length === 0 && _musicTracks.length === 0) {
+        grid.innerHTML = '<p class="empty">No music yet.</p>';
+        return;
+      }
+      const albumsHtml = _musicAlbums.length ? \`<div class="music-grid">\${_musicAlbums.map((a, i) => \`
+        <div class="card music-album-card" onclick="musicShowAlbum(\${i})">
+          \${a.cover ? \`<div class="card-img"><img src="\${_escHtml(a.cover)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">🎵</div>'}
+          <div class="card-body">
+            <div class="card-title">\${_escHtml(a.name)}</div>
+            <div class="card-desc">\${a.tracks.length} track\${a.tracks.length !== 1 ? 's' : ''}</div>
+          </div>
+        </div>\`).join('')}</div>\` : '';
+      const tracksHtml = _musicTracks.length ? \`
+        <div class="music-singles-label">Singles</div>
+        \${_musicTracks.map((t, i) => \`
+          <div class="music-track-row" id="mts-\${i}" onclick="musicPlayStandalone(\${i})">
+            \${t.cover ? \`<img class="music-track-cover" src="\${_escHtml(t.cover)}" alt="">\` : '<div class="music-track-cover-ph">🎵</div>'}
+            <div class="music-track-info"><div class="music-track-title">\${_escHtml(t.title)}</div></div>
+            <div class="music-play-icon">&#9654;</div>
+          </div>\`).join('')}\` : '';
+      grid.innerHTML = albumsHtml + tracksHtml;
+    }
+
+    function musicShowAlbum(idx) {
+      const a = _musicAlbums[idx];
+      document.getElementById('music-album-grid').style.display = 'none';
+      const det = document.getElementById('music-album-detail');
+      det.style.display = 'block';
+      document.getElementById('music-detail-header').innerHTML = \`
+        <div class="music-detail-header">
+          \${a.cover ? \`<img class="music-detail-cover" src="\${_escHtml(a.cover)}" alt="">\` : ''}
+          <div>
+            <div class="music-detail-title">\${_escHtml(a.name)}</div>
+            \${a.description ? \`<div class="music-detail-desc">\${_escHtml(a.description)}</div>\` : ''}
+          </div>
+        </div>\`;
+      document.getElementById('music-track-list').innerHTML = a.tracks.map((t, i) => \`
+        <div class="music-track-row" id="mta-\${idx}-\${i}" onclick="musicPlayAlbumTrack(\${idx},\${i})">
+          <div class="music-track-num">\${t.number}</div>
+          <div class="music-track-info"><div class="music-track-title">\${_escHtml(t.title)}</div></div>
+          <div class="music-play-icon">&#9654;</div>
+        </div>\`).join('');
+    }
+
+    function musicShowGrid() {
+      document.getElementById('music-album-grid').style.display = '';
+      document.getElementById('music-album-detail').style.display = 'none';
+    }
+
+    function musicPlayAlbumTrack(albumIdx, trackIdx) {
+      const a = _musicAlbums[albumIdx], t = a.tracks[trackIdx];
+      _musicCurrentIdx = _musicAllTracks.findIndex(x => x.src === t.src);
+      _musicDoPlay({ ...t, cover: a.cover, albumName: a.name });
+      document.querySelectorAll('[id^="mta-"]').forEach(el => el.classList.remove('playing'));
+      const el = document.getElementById(\`mta-\${albumIdx}-\${trackIdx}\`);
+      if (el) el.classList.add('playing');
+    }
+
+    function musicPlayStandalone(idx) {
+      const t = _musicTracks[idx];
+      _musicCurrentIdx = _musicAllTracks.findIndex(x => x.src === t.src);
+      _musicDoPlay(t);
+      document.querySelectorAll('[id^="mts-"]').forEach(el => el.classList.remove('playing'));
+      const el = document.getElementById(\`mts-\${idx}\`);
+      if (el) el.classList.add('playing');
+    }
+
+    function _musicDoPlay(track) {
+      _musicAudio.src = track.src;
+      _musicAudio.play();
+      const bar = document.getElementById('music-player-bar');
+      bar.style.display = 'block';
+      document.getElementById('music-bar-title').textContent = track.title;
+      document.getElementById('music-bar-album').textContent = track.albumName || '';
+      const art = document.getElementById('music-bar-art');
+      if (track.cover) { art.src = track.cover; art.style.display = 'block'; }
+      else art.style.display = 'none';
+      document.getElementById('music-bar-play').innerHTML = '&#9646;&#9646;';
+    }
+
+    _musicAudio.addEventListener('ended', () => {
+      if (_musicCurrentIdx < _musicAllTracks.length - 1) {
+        _musicCurrentIdx++;
+        _musicDoPlay(_musicAllTracks[_musicCurrentIdx]);
+      } else {
+        document.getElementById('music-bar-play').innerHTML = '&#9654;';
+      }
+    });
+    _musicAudio.addEventListener('timeupdate', () => {
+      if (!_musicAudio.duration) return;
+      document.getElementById('music-bar-fill').style.width = (_musicAudio.currentTime / _musicAudio.duration * 100) + '%';
+      document.getElementById('music-bar-time').textContent = _musicFmt(_musicAudio.currentTime);
+    });
+    _musicAudio.addEventListener('loadedmetadata', () => {
+      document.getElementById('music-bar-dur').textContent = _musicFmt(_musicAudio.duration);
+    });
+
+    function _musicFmt(s) {
+      if (!s || isNaN(s)) return '0:00';
+      return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+    }
+    function musicBarPlayPause() {
+      if (_musicAudio.paused) { _musicAudio.play(); document.getElementById('music-bar-play').innerHTML = '&#9646;&#9646;'; }
+      else { _musicAudio.pause(); document.getElementById('music-bar-play').innerHTML = '&#9654;'; }
+    }
+    function musicBarPrev() {
+      if (_musicCurrentIdx > 0) { _musicCurrentIdx--; _musicDoPlay(_musicAllTracks[_musicCurrentIdx]); }
+    }
+    function musicBarNext() {
+      if (_musicCurrentIdx < _musicAllTracks.length - 1) { _musicCurrentIdx++; _musicDoPlay(_musicAllTracks[_musicCurrentIdx]); }
+    }
+    function musicBarSeek(e) {
+      const r = e.currentTarget.getBoundingClientRect();
+      _musicAudio.currentTime = _musicAudio.duration * ((e.clientX - r.left) / r.width);
     }
     function playVideo(url) {
       document.getElementById('video-iframe').src = url;
@@ -1725,6 +2355,396 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       document.getElementById('video-iframe').src = '';
     }
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closeVideo(); });
+
+    // ── Inline subscription tiers ────────────────────────────────────────────
+    const _subsData = ${JSON.stringify(goods.subscriptions)};
+    let _subsLoaded = false;
+
+    function initSubscriptions() {
+      _subsLoaded = true;
+      renderSubTiers();
+    }
+
+    function renderSubTiers() {
+      const container = document.getElementById('subscriptions-list');
+      if (!_subsData.length) { container.innerHTML = '<p class="empty">No subscription tiers yet.</p>'; return; }
+      container.innerHTML = _subsData.map((tier, i) => {
+        const fmtPrice = (tier.price / 100).toFixed(2);
+        const benefitsHtml = (tier.benefits && tier.benefits.length)
+          ? \`<ul class="sub-benefits">\${tier.benefits.map(b => \`<li>\${_escHtml(b)}</li>\`).join('')}</ul>\`
+          : '';
+        return \`
+        <div class="sub-tier-card">
+          <div class="sub-tier-header">
+            \${tier.image ? \`<img class="sub-tier-img" src="\${_escHtml(tier.image)}" alt="">\` : '<div class="sub-tier-img-ph">🎁</div>'}
+            <div class="sub-tier-info">
+              <div class="sub-tier-name">\${_escHtml(tier.title)}</div>
+              \${tier.description ? \`<div class="sub-tier-desc">\${_escHtml(tier.description)}</div>\` : ''}
+              <div class="sub-tier-price">$\${fmtPrice}<span>/ \${tier.renewalDays || 30} days</span></div>
+              \${benefitsHtml}
+              <button class="sub-btn" onclick="subToggle(\${i})">Subscribe →</button>
+            </div>
+          </div>
+          <div class="sub-form-panel" id="sub-panel-\${i}">
+            <div id="sub-already-\${i}" class="sub-already" style="display:none">
+              <strong>✅ You're already infusing!</strong>
+              <p id="sub-already-desc-\${i}"></p>
+            </div>
+            <div id="sub-recovery-\${i}">
+              <div class="sub-recovery-note">🔑 Choose a recovery key — a word or phrase only you know. You'll use it every time you want to access your membership benefits.</div>
+              <div class="sub-field-group">
+                <label>Recovery Key *</label>
+                <input type="text" id="sub-rkey-\${i}" placeholder="e.g. golden-ticket-2026" autocomplete="off">
+              </div>
+              <button class="sub-btn" onclick="subProceed(\${i})">Continue to Payment →</button>
+              <div id="sub-rkey-error-\${i}" class="sub-error"></div>
+            </div>
+            <div id="sub-payment-\${i}" style="display:none">
+              <div style="font-size:14px;font-weight:600;margin-bottom:12px;">Complete your subscription — $\${fmtPrice} / \${tier.renewalDays || 30} days</div>
+              <div id="sub-stripe-el-\${i}" style="margin-bottom:14px;"></div>
+              <button class="sub-btn" id="sub-pay-btn-\${i}" onclick="subConfirm(\${i})">Pay $\${fmtPrice}</button>
+              <div id="sub-pay-loading-\${i}" style="display:none;font-size:13px;color:#888;margin-top:8px;"></div>
+              <div id="sub-pay-error-\${i}" class="sub-error"></div>
+            </div>
+            <div id="sub-confirm-\${i}" style="display:none">
+              <div class="sub-confirm-box">
+                <div class="icon">🎉</div>
+                <h3>Thank you for infusing!</h3>
+                <div class="renews" id="sub-confirm-renews-\${i}"></div>
+                <p style="font-size:13px;color:#888;margin:8px 0 14px;">Use your recovery key at the <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">membership portal</a> to access exclusive content.</p>
+              </div>
+            </div>
+          </div>
+        </div>\`;
+      }).join('');
+    }
+
+    const _subStripeInst = {}, _subEls = {}, _subClientSecrets = {};
+
+    function subToggle(i) {
+      const panel = document.getElementById(\`sub-panel-\${i}\`);
+      const isOpen = panel.classList.contains('open');
+      document.querySelectorAll('.sub-form-panel').forEach(p => p.classList.remove('open'));
+      if (!isOpen) { panel.classList.add('open'); panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    }
+
+    async function subProceed(i) {
+      const tier = _subsData[i];
+      const recoveryKey = document.getElementById(\`sub-rkey-\${i}\`).value.trim();
+      const errEl = document.getElementById(\`sub-rkey-error-\${i}\`);
+      if (!recoveryKey) { errEl.textContent = 'Recovery key is required.'; errEl.style.display = 'block'; return; }
+      errEl.style.display = 'none';
+      try {
+        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/purchase/intent', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title })
+        });
+        const data = await resp.json();
+        if (data.alreadySubscribed) {
+          document.getElementById(\`sub-recovery-\${i}\`).style.display = 'none';
+          const banner = document.getElementById(\`sub-already-\${i}\`);
+          banner.style.display = 'block';
+          document.getElementById(\`sub-already-desc-\${i}\`).textContent = \`Your subscription is active for \${data.daysLeft} more day\${data.daysLeft !== 1 ? 's' : ''}.\`;
+          return;
+        }
+        if (data.error) { errEl.textContent = data.error; errEl.style.display = 'block'; return; }
+        document.getElementById(\`sub-recovery-\${i}\`).style.display = 'none';
+        document.getElementById(\`sub-payment-\${i}\`).style.display = 'block';
+        _subClientSecrets[i] = data.clientSecret;
+        _subStripeInst[i] = Stripe(data.publishableKey);
+        _subEls[i] = _subStripeInst[i].elements({ clientSecret: data.clientSecret });
+        _subEls[i].create('payment').mount(\`#sub-stripe-el-\${i}\`);
+      } catch (err) {
+        errEl.textContent = 'Could not start checkout. Please try again.';
+        errEl.style.display = 'block';
+      }
+    }
+
+    async function subConfirm(i) {
+      const tier = _subsData[i];
+      const payBtn = document.getElementById(\`sub-pay-btn-\${i}\`);
+      const payLoading = document.getElementById(\`sub-pay-loading-\${i}\`);
+      const payError = document.getElementById(\`sub-pay-error-\${i}\`);
+      payBtn.disabled = true; payLoading.style.display = 'block'; payLoading.textContent = 'Processing…'; payError.style.display = 'none';
+      try {
+        const { error } = await _subStripeInst[i].confirmPayment({
+          elements: _subEls[i], confirmParams: { return_url: window.location.href }, redirect: 'if_required'
+        });
+        if (error) { payError.textContent = error.message; payError.style.display = 'block'; payBtn.disabled = false; payLoading.style.display = 'none'; return; }
+        const recoveryKey = document.getElementById(\`sub-rkey-\${i}\`).value.trim();
+        const paymentIntentId = _subClientSecrets[i] ? _subClientSecrets[i].split('_secret_')[0] : undefined;
+        await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title, amount: tier.price, type: 'subscription', renewalDays: tier.renewalDays || 30, paymentIntentId })
+        });
+        document.getElementById(\`sub-payment-\${i}\`).style.display = 'none';
+        const conf = document.getElementById(\`sub-confirm-\${i}\`);
+        conf.style.display = 'block';
+        const renewsAt = new Date(Date.now() + (tier.renewalDays || 30) * 24 * 60 * 60 * 1000);
+        document.getElementById(\`sub-confirm-renews-\${i}\`).textContent = 'Active until ' + renewsAt.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+      } catch (err) {
+        payError.textContent = 'An unexpected error occurred.'; payError.style.display = 'block';
+        payBtn.disabled = false; payLoading.style.display = 'none';
+      }
+    }
+
+    // ── Inline appointment booking ────────────────────────────────────────────
+    const _apptsData = ${JSON.stringify(goods.appointments)};
+    let _apptsLoaded = false;
+    const _apptState = {}; // per-appointment state: { availableDates, selectedSlot }
+    const _apptStripe = {}, _apptElems = {}, _apptSecrets = {};
+
+    function initAppointments() {
+      _apptsLoaded = true;
+      renderAppts();
+    }
+
+    function renderAppts() {
+      const container = document.getElementById('appointments-list');
+      if (!_apptsData.length) { container.innerHTML = '<p class="empty">No appointments yet.</p>'; return; }
+      container.innerHTML = _apptsData.map((appt, i) => {
+        const fmtPrice = appt.price > 0 ? ('$' + (appt.price / 100).toFixed(2) + '/session') : 'Free';
+        return \`
+        <div class="appt-card">
+          <div class="appt-card-header" onclick="apptToggle(\${i})">
+            \${appt.image ? \`<img class="appt-img" src="\${_escHtml(appt.image)}" alt="">\` : '<div class="appt-img-ph">📅</div>'}
+            <div class="appt-info">
+              <div class="appt-name">\${_escHtml(appt.title)}</div>
+              \${appt.description ? \`<div class="appt-desc">\${_escHtml(appt.description)}</div>\` : ''}
+              <div class="appt-meta">
+                <span class="appt-chip">💰 \${fmtPrice}</span>
+                <span class="appt-chip">⏱ \${appt.duration || 60} min</span>
+              </div>
+              <button class="appt-book-btn">Book →</button>
+            </div>
+          </div>
+          <div class="appt-booking-panel" id="appt-panel-\${i}">
+            <div id="appt-step-dates-\${i}">
+              <h3 style="font-size:15px;font-weight:600;margin-bottom:12px;">Choose a date</h3>
+              <div id="appt-date-strip-\${i}" class="appt-date-strip"></div>
+              <div id="appt-loading-\${i}" style="font-size:13px;color:#888;">Loading availability…</div>
+              <div id="appt-no-slots-\${i}" style="display:none;font-size:13px;color:#888;">No upcoming availability.</div>
+            </div>
+            <div id="appt-step-slots-\${i}" style="display:none">
+              <h3 id="appt-slot-heading-\${i}" style="font-size:15px;font-weight:600;margin-bottom:10px;">Available times</h3>
+              <div id="appt-slot-grid-\${i}" class="appt-slot-grid"></div>
+            </div>
+            <div id="appt-form-\${i}" style="display:none">
+              <div id="appt-slot-display-\${i}" class="appt-selected-slot"></div>
+              <div class="sub-recovery-note">🔑 Choose a recovery key — you'll use it to look up your booking later.</div>
+              <div class="sub-field-group"><label>Recovery Key *</label><input type="text" id="appt-rkey-\${i}" placeholder="e.g. sunflower-2026" autocomplete="off"></div>
+              <div class="sub-field-group"><label>Your Name *</label><input type="text" id="appt-name-\${i}" placeholder="Full name"></div>
+              <div class="sub-field-group"><label>Email *</label><input type="email" id="appt-email-\${i}" placeholder="For booking confirmation"></div>
+              <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
+                <button class="appt-back-btn" onclick="apptBackToSlots(\${i})">← Change time</button>
+                <button class="appt-book-btn" id="appt-proceed-btn-\${i}" onclick="apptProceed(\${i})">\${appt.price === 0 ? 'Confirm Booking →' : 'Continue to Payment →'}</button>
+              </div>
+              <div id="appt-form-error-\${i}" class="sub-error"></div>
+            </div>
+            <div id="appt-payment-\${i}" style="display:none">
+              <div id="appt-slot-display-pay-\${i}" class="appt-selected-slot" style="margin-bottom:14px;"></div>
+              <div id="appt-stripe-el-\${i}" style="margin-bottom:14px;"></div>
+              <button class="appt-book-btn" id="appt-pay-btn-\${i}" onclick="apptConfirmPayment(\${i})">Pay $\${(appt.price/100).toFixed(2)}</button>
+              <div id="appt-pay-loading-\${i}" style="display:none;font-size:13px;color:#888;margin-top:8px;"></div>
+              <div id="appt-pay-error-\${i}" class="sub-error"></div>
+            </div>
+            <div id="appt-confirm-\${i}" style="display:none">
+              <div class="appt-confirm-box">
+                <div class="icon">✅</div>
+                <h3>You're booked!</h3>
+                <div class="slot-label" id="appt-confirm-slot-\${i}"></div>
+                <p style="font-size:12px;color:#888;margin-top:8px;">Keep your recovery key safe — it's how you look up this booking.</p>
+              </div>
+            </div>
+          </div>
+        </div>\`;
+      }).join('');
+    }
+
+    function apptToggle(i) {
+      const panel = document.getElementById(\`appt-panel-\${i}\`);
+      const isOpen = panel.classList.contains('open');
+      document.querySelectorAll('.appt-booking-panel').forEach(p => p.classList.remove('open'));
+      if (!isOpen) {
+        panel.classList.add('open');
+        panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        if (!_apptState[i]) { _apptState[i] = {}; apptLoadSlots(i); }
+      }
+    }
+
+    async function apptLoadSlots(i) {
+      const appt = _apptsData[i];
+      const loadingEl = document.getElementById(\`appt-loading-\${i}\`);
+      const noSlotsEl = document.getElementById(\`appt-no-slots-\${i}\`);
+      try {
+        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/book/' + encodeURIComponent(appt.title) + '/slots');
+        const data = await resp.json();
+        loadingEl.style.display = 'none';
+        if (!data.available || !data.available.length) { noSlotsEl.style.display = 'block'; return; }
+        _apptState[i].availableDates = data.available;
+        apptRenderDateStrip(i);
+        apptSelectDate(i, data.available[0]);
+      } catch (err) {
+        loadingEl.textContent = 'Could not load availability.';
+      }
+    }
+
+    function apptRenderDateStrip(i) {
+      const strip = document.getElementById(\`appt-date-strip-\${i}\`);
+      strip.innerHTML = '';
+      (_apptState[i].availableDates || []).forEach((d, di) => {
+        const parts = d.date.split('-');
+        const dateObj = new Date(+parts[0], +parts[1] - 1, +parts[2]);
+        const dow = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+        const mon = dateObj.toLocaleDateString('en-US', { month: 'short' });
+        const card = document.createElement('div');
+        card.className = 'appt-date-card';
+        card.innerHTML = \`<div class="dow">\${dow}</div><div class="dom">\${dateObj.getDate()}</div><div class="mon">\${mon}</div>\`;
+        card.addEventListener('click', () => apptSelectDate(i, d));
+        strip.appendChild(card);
+      });
+    }
+
+    function apptSelectDate(i, dateData) {
+      _apptState[i].selectedDate = dateData;
+      _apptState[i].selectedSlot = null;
+      document.querySelectorAll(\`#appt-date-strip-\${i} .appt-date-card\`).forEach((c, di) => {
+        c.classList.toggle('active', (_apptState[i].availableDates || [])[di] === dateData);
+      });
+      const slotsDiv = document.getElementById(\`appt-step-slots-\${i}\`);
+      slotsDiv.style.display = 'block';
+      document.getElementById(\`appt-slot-heading-\${i}\`).textContent = 'Times on ' + dateData.dayLabel;
+      apptRenderSlots(i, dateData.slots);
+      document.getElementById(\`appt-form-\${i}\`).style.display = 'none';
+      document.getElementById(\`appt-payment-\${i}\`).style.display = 'none';
+    }
+
+    function apptRenderSlots(i, slots) {
+      const grid = document.getElementById(\`appt-slot-grid-\${i}\`);
+      grid.innerHTML = '';
+      slots.forEach(slotStr => {
+        const [, time] = slotStr.split('T');
+        const [h, m] = time.split(':').map(Number);
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 || 12;
+        const label = h12 + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+        const btn = document.createElement('button');
+        btn.className = 'appt-slot-btn';
+        btn.textContent = label;
+        btn.addEventListener('click', () => apptSelectSlot(i, slotStr, label));
+        grid.appendChild(btn);
+      });
+    }
+
+    function apptSelectSlot(i, slotStr, label) {
+      _apptState[i].selectedSlot = slotStr;
+      document.querySelectorAll(\`#appt-slot-grid-\${i} .appt-slot-btn\`).forEach(b => b.classList.remove('active'));
+      event.currentTarget.classList.add('active');
+      const display = apptFormatSlot(i, slotStr);
+      document.getElementById(\`appt-slot-display-\${i}\`).textContent = '📅 ' + display;
+      const formDiv = document.getElementById(\`appt-form-\${i}\`);
+      formDiv.style.display = 'block';
+      formDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function apptFormatSlot(i, slotStr) {
+      const appt = _apptsData[i];
+      const [datePart, timePart] = slotStr.split('T');
+      const [y, mo, d] = datePart.split('-').map(Number);
+      const [h, m] = timePart.split(':').map(Number);
+      const dateObj = new Date(y, mo - 1, d);
+      const dateLabel = dateObj.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      const h12 = h % 12 || 12;
+      return dateLabel + ' at ' + h12 + ':' + String(m).padStart(2,'0') + ' ' + ampm + ' ' + (appt.timezone || '');
+    }
+
+    function apptBackToSlots(i) {
+      _apptState[i].selectedSlot = null;
+      document.getElementById(\`appt-form-\${i}\`).style.display = 'none';
+      document.getElementById(\`appt-payment-\${i}\`).style.display = 'none';
+      document.querySelectorAll(\`#appt-slot-grid-\${i} .appt-slot-btn\`).forEach(b => b.classList.remove('active'));
+    }
+
+    async function apptProceed(i) {
+      const appt = _apptsData[i];
+      const recoveryKey = document.getElementById(\`appt-rkey-\${i}\`).value.trim();
+      const name = document.getElementById(\`appt-name-\${i}\`).value.trim();
+      const email = document.getElementById(\`appt-email-\${i}\`).value.trim();
+      const errEl = document.getElementById(\`appt-form-error-\${i}\`);
+      const selectedSlot = _apptState[i] && _apptState[i].selectedSlot;
+      if (!recoveryKey) { errEl.textContent = 'Recovery key is required.'; errEl.style.display = 'block'; return; }
+      if (!name) { errEl.textContent = 'Name is required.'; errEl.style.display = 'block'; return; }
+      if (!email) { errEl.textContent = 'Email is required.'; errEl.style.display = 'block'; return; }
+      if (!selectedSlot) { errEl.textContent = 'Please select a time slot.'; errEl.style.display = 'block'; return; }
+      errEl.style.display = 'none';
+      document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = true;
+      try {
+        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/purchase/intent', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot })
+        });
+        const data = await resp.json();
+        if (data.error) { errEl.textContent = data.error; errEl.style.display = 'block'; document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = false; return; }
+        if (data.free) {
+          await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot, contactInfo: { name, email } })
+          });
+          document.getElementById(\`appt-form-\${i}\`).style.display = 'none';
+          apptShowConfirm(i, selectedSlot);
+          return;
+        }
+        document.getElementById(\`appt-form-\${i}\`).style.display = 'none';
+        const payDiv = document.getElementById(\`appt-payment-\${i}\`);
+        payDiv.style.display = 'block';
+        document.getElementById(\`appt-slot-display-pay-\${i}\`).textContent = '📅 ' + apptFormatSlot(i, selectedSlot);
+        _apptSecrets[i] = data.clientSecret;
+        _apptStripe[i] = Stripe(data.publishableKey);
+        _apptElems[i] = _apptStripe[i].elements({ clientSecret: data.clientSecret });
+        _apptElems[i].create('payment').mount(\`#appt-stripe-el-\${i}\`);
+        payDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } catch (err) {
+        errEl.textContent = 'Could not start checkout. Please try again.';
+        errEl.style.display = 'block';
+        document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = false;
+      }
+    }
+
+    async function apptConfirmPayment(i) {
+      const appt = _apptsData[i];
+      const payBtn = document.getElementById(\`appt-pay-btn-\${i}\`);
+      const payLoading = document.getElementById(\`appt-pay-loading-\${i}\`);
+      const payError = document.getElementById(\`appt-pay-error-\${i}\`);
+      payBtn.disabled = true; payLoading.style.display = 'block'; payLoading.textContent = 'Processing…'; payError.style.display = 'none';
+      try {
+        const { error } = await _apptStripe[i].confirmPayment({
+          elements: _apptElems[i], confirmParams: { return_url: window.location.href }, redirect: 'if_required'
+        });
+        if (error) { payError.textContent = error.message; payError.style.display = 'block'; payBtn.disabled = false; payLoading.style.display = 'none'; return; }
+        const recoveryKey = document.getElementById(\`appt-rkey-\${i}\`).value.trim();
+        const name = document.getElementById(\`appt-name-\${i}\`).value.trim();
+        const email = document.getElementById(\`appt-email-\${i}\`).value.trim();
+        const selectedSlot = _apptState[i] && _apptState[i].selectedSlot;
+        const paymentIntentId = _apptSecrets[i] ? _apptSecrets[i].split('_secret_')[0] : undefined;
+        await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot, contactInfo: { name, email }, paymentIntentId })
+        });
+        document.getElementById(\`appt-payment-\${i}\`).style.display = 'none';
+        apptShowConfirm(i, selectedSlot);
+      } catch (err) {
+        payError.textContent = 'An unexpected error occurred.'; payError.style.display = 'block';
+        payBtn.disabled = false; payLoading.style.display = 'none';
+      }
+    }
+
+    function apptShowConfirm(i, slotStr) {
+      const conf = document.getElementById(\`appt-confirm-\${i}\`);
+      conf.style.display = 'block';
+      document.getElementById(\`appt-confirm-slot-\${i}\`).textContent = apptFormatSlot(i, slotStr);
+      conf.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
 
     async function startVideoUpload(input, shoppeId, title) {
       const file = input.files[0];
@@ -1950,22 +2970,53 @@ async function startServer(params) {
   });
 
   // Upload goods archive (auth via manifest uuid+emojicode)
-  app.post('/plugin/shoppe/upload', upload.single('archive'), async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ success: false, error: 'No archive uploaded' });
-      }
-      console.log('[shoppe] Processing archive:', req.file.originalname);
-      const result = await processArchive(req.file.path);
-      res.json({ success: true, ...result });
-    } catch (err) {
-      console.error('[shoppe] upload error:', err);
-      res.status(500).json({ success: false, error: err.message });
-    } finally {
-      if (req.file && fs.existsSync(req.file.path)) {
-        try { fs.unlinkSync(req.file.path); } catch (e) {}
-      }
+  app.post('/plugin/shoppe/upload', upload.single('archive'), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No archive uploaded' });
     }
+
+    const jobId = crypto.randomBytes(8).toString('hex');
+    const job = { sse: null, queue: [], done: false };
+    uploadJobs.set(jobId, job);
+    setTimeout(() => uploadJobs.delete(jobId), 15 * 60 * 1000); // clean up after 15 min
+
+    res.json({ success: true, jobId });
+
+    function emit(type, data) {
+      job.queue.push({ type, data });
+      if (job.sse) job.sse.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+
+    const zipPath = req.file.path;
+    console.log('[shoppe] Processing archive:', req.file.originalname);
+    processArchive(zipPath, emit)
+      .then(result  => emit('complete', { success: true, ...result }))
+      .catch(err    => { console.error('[shoppe] upload error:', err); emit('error', { message: err.message }); })
+      .finally(() => {
+        job.done = true;
+        if (job.sse) { job.sse.end(); job.sse = null; }
+        if (fs.existsSync(zipPath)) try { fs.unlinkSync(zipPath); } catch (e) {}
+      });
+  });
+
+  app.get('/plugin/shoppe/upload/progress/:jobId', (req, res) => {
+    const job = uploadJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Unknown job' });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    // Replay buffered events for late-connecting clients.
+    for (const evt of job.queue) {
+      res.write(`event: ${evt.type}\ndata: ${JSON.stringify(evt.data)}\n\n`);
+    }
+
+    if (job.done) { res.end(); return; }
+
+    job.sse = res;
+    req.on('close', () => { if (job.sse === res) job.sse = null; });
   });
 
   // Get config (owner only)
@@ -2649,6 +3700,38 @@ async function startServer(params) {
       const goods = await getShoppeGoods(tenant);
       const cat = req.query.category;
       res.json({ success: true, goods: (cat && goods[cat]) ? goods[cat] : goods });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Music feed — adapts Sanora Canimus feed to { albums, tracks }
+  app.get('/plugin/shoppe/:identifier/music/feed', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      const feedResp = await fetchWithRetry(`${getSanoraUrl()}/feeds/music/${tenant.uuid}`, { timeout: 10000 });
+      if (!feedResp.ok) return res.status(502).json({ error: 'Feed unavailable' });
+      const feed = await feedResp.json();
+
+      const albums = [];
+      const tracks = [];
+      for (const item of (feed.items || [])) {
+        const cover = (item.images && (item.images.cover?.url || item.images[0]?.url)) || null;
+        const mediaItems = (item.media || []).filter(m => m.url);
+        if (mediaItems.length === 0) continue;
+        if (mediaItems.length > 1) {
+          albums.push({
+            name: item.name,
+            cover,
+            description: item.summary || '',
+            tracks: mediaItems.map((m, i) => ({ number: i + 1, title: `Track ${i + 1}`, src: m.url, type: m.type || 'audio/mpeg' }))
+          });
+        } else {
+          tracks.push({ title: item.name, src: mediaItems[0].url, cover, description: item.summary || '' });
+        }
+      }
+      res.json({ albums, tracks });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

@@ -44,6 +44,10 @@
             .sw-status.success { background: #d1fae5; color: #065f46; display: block; }
             .sw-status.error   { background: #fee2e2; color: #991b1b; display: block; }
             .sw-status code { background: rgba(0,0,0,0.08); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+            .sw-progress-bar-track { background: rgba(0,0,0,0.12); border-radius: 4px; height: 8px; margin: 8px 0; overflow: hidden; }
+            .sw-progress-bar-fill  { height: 100%; background: #1a56db; border-radius: 4px; width: 0%; transition: width 0.25s ease; }
+            .sw-progress-meta { display: flex; justify-content: space-between; font-size: 12px; opacity: 0.75; }
+            .sw-progress-item { margin-top: 6px; font-size: 13px; font-style: italic; }
             .sw-remove { display: block; width: 100%; margin-top: 24px; padding: 8px; background: none; border: 1px solid #e5e5ea; border-radius: 8px; font-size: 12px; color: #aaa; cursor: pointer; text-align: center; }
             .sw-remove:hover { border-color: #cc0000; color: #cc0000; }
           </style>
@@ -313,25 +317,72 @@
   // ── Upload ──────────────────────────────────────────────────────────────────
 
   async function uploadArchive(file, container) {
+    const statusEl = container.querySelector('#sw-upload-status');
+
+    // Step 1: POST the file, get a jobId back immediately.
     showStatus(container, '#sw-upload-status', `⏳ Uploading <strong>${file.name}</strong>…`, 'info');
     const form = new FormData();
     form.append('archive', file);
+    let jobId;
     try {
       const resp = await fetch('/plugin/shoppe/upload', { method: 'POST', body: form });
       const result = await resp.json();
-      if (!result.success) throw new Error(result.error || 'Upload failed');
+      if (!result.success || !result.jobId) throw new Error(result.error || 'Upload failed');
+      jobId = result.jobId;
+    } catch (err) {
+      showStatus(container, '#sw-upload-status', `❌ ${err.message}`, 'error');
+      return;
+    }
 
+    // Step 2: Show progress UI and open SSE stream.
+    statusEl.className = 'sw-status info';
+    statusEl.style.display = 'block';
+    statusEl.innerHTML = `
+      <div id="sw-progress-title" style="font-weight:600;margin-bottom:6px;">⏳ Processing archive…</div>
+      <div class="sw-progress-bar-track"><div id="sw-progress-fill" class="sw-progress-bar-fill"></div></div>
+      <div class="sw-progress-meta">
+        <span id="sw-progress-count">0 / …</span>
+        <span id="sw-progress-pct">0%</span>
+      </div>
+      <div id="sw-progress-item" class="sw-progress-item"></div>
+    `;
+
+    const fillEl  = statusEl.querySelector('#sw-progress-fill');
+    const countEl = statusEl.querySelector('#sw-progress-count');
+    const pctEl   = statusEl.querySelector('#sw-progress-pct');
+    const itemEl  = statusEl.querySelector('#sw-progress-item');
+    const titleEl = statusEl.querySelector('#sw-progress-title');
+
+    const es = new EventSource(`/plugin/shoppe/upload/progress/${jobId}`);
+
+    es.addEventListener('start', e => {
+      const { total, name } = JSON.parse(e.data);
+      titleEl.innerHTML = `⏳ Uploading <strong>${name}</strong> — ${total} item${total !== 1 ? 's' : ''}`;
+      countEl.textContent = `0 / ${total}`;
+    });
+
+    es.addEventListener('progress', e => {
+      const { current, total, label } = JSON.parse(e.data);
+      const pct = total > 0 ? Math.round(current / total * 100) : 0;
+      fillEl.style.width  = pct + '%';
+      countEl.textContent = `${current} / ${total}`;
+      pctEl.textContent   = pct + '%';
+      itemEl.textContent  = label;
+    });
+
+    es.addEventListener('complete', e => {
+      es.close();
+      const result = JSON.parse(e.data);
       const r = result.results;
       const counts = [
-        r.books.length        && `📚 ${r.books.length} book${r.books.length !== 1 ? 's' : ''}`,
-        r.music.length        && `🎵 ${r.music.length} music item${r.music.length !== 1 ? 's' : ''}`,
-        r.posts.length        && `📝 ${r.posts.length} post${r.posts.length !== 1 ? 's' : ''}`,
-        r.albums.length       && `🖼️ ${r.albums.length} album${r.albums.length !== 1 ? 's' : ''}`,
-        r.products.length     && `📦 ${r.products.length} product${r.products.length !== 1 ? 's' : ''}`,
+        r.books        && r.books.length        && `📚 ${r.books.length} book${r.books.length !== 1 ? 's' : ''}`,
+        r.music        && r.music.length        && `🎵 ${r.music.length} music item${r.music.length !== 1 ? 's' : ''}`,
+        r.posts        && r.posts.length        && `📝 ${r.posts.length} post${r.posts.length !== 1 ? 's' : ''}`,
+        r.albums       && r.albums.length       && `🖼️ ${r.albums.length} album${r.albums.length !== 1 ? 's' : ''}`,
+        r.products     && r.products.length     && `📦 ${r.products.length} product${r.products.length !== 1 ? 's' : ''}`,
         r.appointments && r.appointments.length && `📅 ${r.appointments.length} appointment${r.appointments.length !== 1 ? 's' : ''}`,
         r.subscriptions && r.subscriptions.length && `🎁 ${r.subscriptions.length} subscription tier${r.subscriptions.length !== 1 ? 's' : ''}`
       ].filter(Boolean).join(' · ') || 'no items found';
-
       const warnings = (r.warnings && r.warnings.length > 0)
         ? `<br><br>⚠️ <strong>Warnings (${r.warnings.length}):</strong><br>${r.warnings.map(w => `• ${w}`).join('<br>')}`
         : '';
@@ -340,9 +391,14 @@
          <a href="/plugin/shoppe/${result.tenant.uuid}" target="_blank" class="sw-link" style="display:inline-block;margin-top:8px;">View your shoppe →</a>`,
         'success');
       loadDirectory(container);
-    } catch (err) {
-      showStatus(container, '#sw-upload-status', `❌ ${err.message}`, 'error');
-    }
+    });
+
+    es.addEventListener('error', e => {
+      es.close();
+      let msg = 'Upload failed';
+      try { msg = JSON.parse(e.data).message; } catch (err) { /* use default */ }
+      showStatus(container, '#sw-upload-status', `❌ ${msg}`, 'error');
+    });
   }
 
   // ── Save URL (owner) ────────────────────────────────────────────────────────
